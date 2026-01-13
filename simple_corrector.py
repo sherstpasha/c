@@ -604,84 +604,94 @@ def optuna_optimize(config_base: Dict = None, n_trials: int = 100):
 # GRID SEARCH (Полный перебор)
 # ======================================================
 
+
 def grid_search_full():
     """Полный перебор всех комбинаций параметров"""
     from itertools import product
-    
+
     config_base = CONFIG.copy()
-    
+
     # Загружаем данные
     corr = SimpleCorrector(config_base)
     df = corr.load_data()
     print(f"Loaded {len(df)} word pairs\n")
-    
+
     # === ПОЛНАЯ СЕТКА ПАРАМЕТРОВ ===
     param_grid = {
         "model_type": ["logistic", "random_forest", "gradient_boosting"],
-        
         # Общие параметры
         "context_size": [1, 2, 3, 4],
         "min_rule_freq": [2, 3, 5, 10],
         "negative_ratio": [1.0, 1.5, 2.0, 3.0, 5.0],
         "prob_threshold": [0.2, 0.3, 0.4, 0.5, 0.6, 0.7, 0.8],
         "gate_k": [0.5, 1.0, 1.5, 2.0, 3.0, 5.0, 10.0],
-        
         # LogisticRegression
         "lr_C": [0.01, 0.1, 1.0, 10.0, 100.0],
         "lr_max_iter": [100, 300, 500],
-        
         # RandomForest
         "rf_n_estimators": [50, 100, 200],
         "rf_max_depth": [5, 10, 15, None],
         "rf_min_samples_split": [2, 5, 10],
         "rf_min_samples_leaf": [1, 2, 5],
-        
         # GradientBoosting
         "gb_n_estimators": [50, 100, 200],
         "gb_max_depth": [3, 5, 7],
         "gb_learning_rate": [0.01, 0.05, 0.1, 0.3],
         "gb_min_samples_split": [2, 5, 10],
     }
-    
+
     # Генерируем комбинации с учётом модели
     all_results = []
-    
+
     for model_type in param_grid["model_type"]:
         # Общие параметры
-        common_keys = ["context_size", "min_rule_freq", "negative_ratio", 
-                       "prob_threshold", "gate_k"]
-        
+        common_keys = [
+            "context_size",
+            "min_rule_freq",
+            "negative_ratio",
+            "prob_threshold",
+            "gate_k",
+        ]
+
         # Параметры конкретной модели
         if model_type == "logistic":
             model_keys = ["lr_C", "lr_max_iter"]
         elif model_type == "random_forest":
-            model_keys = ["rf_n_estimators", "rf_max_depth", 
-                          "rf_min_samples_split", "rf_min_samples_leaf"]
+            model_keys = [
+                "rf_n_estimators",
+                "rf_max_depth",
+                "rf_min_samples_split",
+                "rf_min_samples_leaf",
+            ]
         else:  # gradient_boosting
-            model_keys = ["gb_n_estimators", "gb_max_depth", 
-                          "gb_learning_rate", "gb_min_samples_split"]
-        
+            model_keys = [
+                "gb_n_estimators",
+                "gb_max_depth",
+                "gb_learning_rate",
+                "gb_min_samples_split",
+            ]
+
         all_keys = ["model_type"] + common_keys + model_keys
         all_values = [[model_type]] + [param_grid[k] for k in common_keys + model_keys]
-        
+
         combinations = list(product(*all_values))
-        
+
         print(f"\n{model_type}: {len(combinations)} combinations")
-        
+
         for i, combo in enumerate(combinations):
             config = config_base.copy()
-            
+
             # Заполняем конфиг
             for key, value in zip(all_keys, combo):
                 config[key] = value
-            
+
             try:
                 corr = SimpleCorrector(config)
                 corr.df = df
                 corr.fit(df)
-                
+
                 eval_result = corr.evaluate(df)
-                
+
                 result = {
                     **{k: v for k, v in zip(all_keys, combo)},
                     "precision": eval_result["precision"],
@@ -690,38 +700,49 @@ def grid_search_full():
                     "applied": eval_result["corrections_applied"],
                     "cer_delta": eval_result["cer_delta"],
                     "acc_delta": eval_result["acc_delta"],
-                    "score": eval_result["precision"] * min(1.0, eval_result["corrections_applied"] / 50)
+                    "score": eval_result["precision"]
+                    * min(1.0, eval_result["corrections_applied"] / 50),
                 }
-                
+
                 all_results.append(result)
-                
+
                 # Прогресс
                 if (i + 1) % 50 == 0:
                     best_score = max([r["score"] for r in all_results])
-                    print(f"  Progress: {i + 1}/{len(combinations)}, best_score={best_score:.4f}")
-                
+                    print(
+                        f"  Progress: {i + 1}/{len(combinations)}, best_score={best_score:.4f}"
+                    )
+
             except Exception as e:
                 print(f"  Error at combo {i}: {e}")
                 continue
-    
+
     # Сохраняем результаты
     results_df = pd.DataFrame(all_results)
     results_df = results_df.sort_values("score", ascending=False)
     results_df.to_csv("simple_corrector_grid_full.csv", index=False)
-    
+
     print("\n" + "=" * 70)
     print("GRID SEARCH COMPLETE")
     print("=" * 70)
     print(f"\nTotal combinations tested: {len(results_df)}")
     print(f"Results saved to: simple_corrector_grid_full.csv")
-    
+
     # Лучший результат
     best = results_df.iloc[0]
     print("\n=== BEST CONFIGURATION ===")
     for key in results_df.columns:
-        if key not in ["score", "precision", "improved", "worsened", "applied", "cer_delta", "acc_delta"]:
+        if key not in [
+            "score",
+            "precision",
+            "improved",
+            "worsened",
+            "applied",
+            "cer_delta",
+            "acc_delta",
+        ]:
             print(f"  {key}: {best[key]}")
-    
+
     print("\n=== BEST METRICS ===")
     print(f"  Score: {best['score']:.4f}")
     print(f"  Precision: {best['precision']:.4f}")
@@ -730,16 +751,18 @@ def grid_search_full():
     print(f"  Worsened: {best['worsened']}")
     print(f"  CER delta: {best['cer_delta']:.6f}")
     print(f"  Acc delta: {best['acc_delta']:.6f}")
-    
+
     # ТОП-20 по каждой модели
     print("\n=== TOP 20 BY MODEL ===")
     for model in ["logistic", "random_forest", "gradient_boosting"]:
         print(f"\n{model}:")
         top = results_df[results_df["model_type"] == model].head(20)
         for i, row in top.iterrows():
-            print(f"  {len(top) - len(top) + list(top.index).index(i) + 1}. score={row['score']:.4f}, "
-                  f"prec={row['precision']:.4f}, applied={row['applied']}")
-    
+            print(
+                f"  {len(top) - len(top) + list(top.index).index(i) + 1}. score={row['score']:.4f}, "
+                f"prec={row['precision']:.4f}, applied={row['applied']}"
+            )
+
     return results_df
 
 
@@ -753,7 +776,7 @@ if __name__ == "__main__":
     if len(sys.argv) > 1 and sys.argv[1] == "grid":
         # Полный перебор
         results_df = grid_search_full()
-        
+
     elif len(sys.argv) > 1 and sys.argv[1] == "optuna":
         n_trials = int(sys.argv[2]) if len(sys.argv) > 2 else 100
         study, best_config = optuna_optimize(n_trials=n_trials)
