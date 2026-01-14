@@ -5,6 +5,25 @@ OCR Corrector: Gate Model + Rule-based Correction
 1. Gate модель решает, нужно ли исправлять слово
 2. Если gate пропускает (prob >= threshold), применяется корректор
 3. Корректор использует правила OCR→GT для исправления
+
+Новые возможности (Уровень 1 - языковые признаки):
+- Биграммы слева/справа от символа (bigram_L, bigram_R)
+- Триграммы (символ с контекстом слева и справа)
+- Энтропия символа (сколько вариантов замен имеет символ)
+- Позиционные признаки (начало/конец слова, относительная позиция)
+
+Beam Search (Уровень 2):
+- Рассматривает несколько кандидатов на каждой позиции
+- Может делать несколько замен в одном слове
+- Параметры: beam_size, beam_lambda, top_k_candidates
+
+Параметры в CONFIG:
+- corr_use_ngrams: включить n-граммы (по умолчанию True)
+- corr_use_entropy: включить энтропию (по умолчанию True)
+- corr_use_beam_search: включить beam search (по умолчанию False)
+- corr_beam_size: размер beam (по умолчанию 5)
+- corr_beam_lambda: вес языковой модели (по умолчанию 0.1)
+- corr_top_k_candidates: топ-K кандидатов на позицию (по умолчанию 3)
 """
 
 import pandas as pd
@@ -37,6 +56,7 @@ CONFIG = {
     "gate_class_weight": "balanced",  # баланс классов
     "gate_target_precision": 0.7,  # целевая точность для подбора порога
     "gate_threshold": None,  # можно задать фиксированный порог (иначе подберётся)
+    "gate_valid_size": 0.2,  # размер validation set для Gate
     # === Rule Extractor параметры ===
     "rule_max_ngram": 3,  # максимальная длина n-граммы правила
     "rule_max_context_dist": 1,  # макс расстояние контекста слева/справа
@@ -49,6 +69,18 @@ CONFIG = {
     "corr_negative_ratio": 2.0,  # соотношение negative/positive samples
     "corr_prob_threshold": 0.5,  # порог вероятности для применения правки
     "corr_gate_k": 2.0,  # коэффициент gating (p_change > p_no_change * k)
+    "corr_gate_alpha": 0.5,  # связь с gate: best_prob >= alpha * gate_prob
+    # === Языковые признаки ===
+    "corr_use_ngrams": True,  # биграммы и триграммы
+    "corr_use_entropy": True,  # энтропия символа
+    "corr_use_morpheme_zones": True,  # зоны морфем (prefix/suffix)
+    "corr_use_rule_freq": True,  # использовать частоты правил как признак
+    # === Beam Search ===
+    "corr_use_beam_search": False,  # включить beam search
+    "corr_beam_size": 5,  # размер beam
+    "corr_beam_lambda": 0.1,  # вес языковой модели
+    "corr_top_k_candidates": 3,  # топ-K кандидатов на позицию
+    "corr_no_change_penalty": 0.0,  # штраф для NO_CHANGE в beam (log-space)
     # === Общие параметры ===
     "random_state": 42,
 }
@@ -108,6 +140,70 @@ def normalize_word(w: str) -> str:
 def add_position_markers(w: str) -> str:
     """Добавление маркеров начала/конца"""
     return f"^{w}$"
+
+
+# ======================================================
+# CHARACTER LANGUAGE MODEL
+# ======================================================
+
+
+class CharLM:
+    """
+    Простая триграммная символьная языковая модель.
+    Используется для скоринга слов в beam search.
+    """
+
+    def __init__(self, smoothing: float = 1e-6):
+        self.smoothing = smoothing
+        self.trigram_counts = {}
+        self.bigram_counts = {}
+        self.total_trigrams = 0
+
+    def fit(self, words: List[str]) -> "CharLM":
+        """Обучить LM на списке слов"""
+        from collections import Counter
+
+        trigrams = []
+        bigrams = []
+
+        for word in words:
+            # Добавляем маркеры начала/конца
+            w = f"^^{word}$$"
+            for i in range(len(w) - 2):
+                trigrams.append(w[i : i + 3])
+                bigrams.append(w[i : i + 2])
+            # Последний bigram
+            if len(w) >= 2:
+                bigrams.append(w[-2:])
+
+        self.trigram_counts = Counter(trigrams)
+        self.bigram_counts = Counter(bigrams)
+        self.total_trigrams = sum(self.trigram_counts.values())
+
+        return self
+
+    def log_prob_trigram(self, trigram: str) -> float:
+        """Log-вероятность триграммы P(c3|c1c2)"""
+        bigram = trigram[:2]
+        tri_count = self.trigram_counts.get(trigram, 0) + self.smoothing
+        bi_count = self.bigram_counts.get(bigram, 0) + self.smoothing * 100
+        return np.log(tri_count / bi_count)
+
+    def log_prob_word(self, word: str) -> float:
+        """Log-вероятность слова = сумма log P(trigram)"""
+        w = f"^^{word}$$"
+        log_prob = 0.0
+        for i in range(len(w) - 2):
+            log_prob += self.log_prob_trigram(w[i : i + 3])
+        return log_prob
+
+    def perplexity(self, word: str) -> float:
+        """Перплексия слова (меньше = лучше)"""
+        w = f"^^{word}$$"
+        n_trigrams = len(w) - 2
+        if n_trigrams <= 0:
+            return float("inf")
+        return np.exp(-self.log_prob_word(word) / n_trigrams)
 
 
 # ======================================================
@@ -342,7 +438,17 @@ class CorrectorModel:
         negative_ratio: float = 2.0,
         prob_threshold: float = 0.6,
         gate_k: float = 3.0,
+        gate_alpha: float = 0.5,
         random_state: int = 42,
+        use_ngrams: bool = True,
+        use_entropy: bool = True,
+        use_morpheme_zones: bool = True,
+        use_rule_freq: bool = True,
+        use_beam_search: bool = False,
+        beam_size: int = 5,
+        beam_lambda: float = 0.1,
+        top_k_candidates: int = 3,
+        no_change_penalty: float = 0.0,
     ):
         self.context_size = context_size
         self.max_iter = max_iter
@@ -350,12 +456,25 @@ class CorrectorModel:
         self.negative_ratio = negative_ratio
         self.prob_threshold = prob_threshold
         self.gate_k = gate_k
+        self.gate_alpha = gate_alpha
         self.random_state = random_state
+        self.use_ngrams = use_ngrams
+        self.use_entropy = use_entropy
+        self.use_morpheme_zones = use_morpheme_zones
+        self.use_rule_freq = use_rule_freq
+        self.use_beam_search = use_beam_search
+        self.beam_size = beam_size
+        self.beam_lambda = beam_lambda
+        self.top_k_candidates = top_k_candidates
+        self.no_change_penalty = no_change_penalty
 
         self.vec = None
         self.clf = None
         self.classes = None
         self.no_change_idx = None
+        self.char_entropy = {}  # для хранения энтропии символов
+        self.rule_freq = {}  # частоты правил (ocr_char, gt_char) -> log(count+1)
+        self.char_lm = None  # символьная языковая модель
 
     def _extract_positive_samples(self, df: pd.DataFrame) -> pd.DataFrame:
         """Извлечь positive samples (реальные OCR ошибки)"""
@@ -394,6 +513,8 @@ class CorrectorModel:
                         "y": ch_gt,
                         "left": left,
                         "right": right,
+                        "pos_in_word": i,
+                        "word_len": len(ocr),
                     }
                 )
 
@@ -430,6 +551,8 @@ class CorrectorModel:
                             "y": NO_CHANGE,
                             "left": left,
                             "right": right,
+                            "pos_in_word": i,
+                            "word_len": len(ocr),
                         }
                     )
 
@@ -446,13 +569,55 @@ class CorrectorModel:
         """Создать признаки для одного примера"""
         feats = {f"ocr={row['ocr']}": 1}
 
+        # Контекст слева
         for i, ch in enumerate(row["left"][::-1]):
             if is_valid_symbol(ch):
                 feats[f"L{i+1}={ch}"] = 1
 
+        # Контекст справа
         for i, ch in enumerate(row["right"]):
             if is_valid_symbol(ch):
                 feats[f"R{i+1}={ch}"] = 1
+
+        # Языковые признаки (n-граммы)
+        if self.use_ngrams:
+            ch = row["ocr"]
+            left = row["left"]
+            right = row["right"]
+
+            # Биграмма слева
+            if len(left) > 0:
+                feats[f"bigram_L={left[-1]}{ch}"] = 1
+
+            # Биграмма справа
+            if len(right) > 0:
+                feats[f"bigram_R={ch}{right[0]}"] = 1
+
+            # Триграмма
+            if len(left) > 0 and len(right) > 0:
+                feats[f"trigram={left[-1]}{ch}{right[0]}"] = 1
+
+        # Позиционные признаки
+        pos_ratio = row["pos_in_word"] / max(row["word_len"], 1)
+        feats["pos_ratio"] = pos_ratio
+        feats["is_start"] = 1 if row["pos_in_word"] == 0 else 0
+        feats["is_end"] = 1 if row["pos_in_word"] == row["word_len"] - 1 else 0
+
+        # Морфемные зоны (prefix/suffix)
+        if self.use_morpheme_zones:
+            feats["is_prefix_zone"] = 1 if pos_ratio < 0.3 else 0
+            feats["is_suffix_zone"] = 1 if pos_ratio > 0.6 else 0
+            feats["is_middle_zone"] = 1 if 0.3 <= pos_ratio <= 0.6 else 0
+
+        # Энтропия символа
+        if self.use_entropy and row["ocr"] in self.char_entropy:
+            feats["entropy"] = self.char_entropy[row["ocr"]]
+
+        # Частота правила (если есть target)
+        if self.use_rule_freq and "y" in row and row["y"] != NO_CHANGE:
+            rule_key = (row["ocr"], row["y"])
+            if rule_key in self.rule_freq:
+                feats["rule_freq"] = self.rule_freq[rule_key]
 
         return feats
 
@@ -465,6 +630,44 @@ class CorrectorModel:
         # Negative samples
         neg_df = self._extract_negative_samples(df, len(pos_df))
         print(f"Negative samples: {len(neg_df)}")
+
+        # Вычисление энтропии символов
+        if self.use_entropy and not pos_df.empty:
+            from collections import Counter
+
+            char_replacements = {}
+            for _, row in pos_df.iterrows():
+                ocr_ch = row["ocr"]
+                if ocr_ch not in char_replacements:
+                    char_replacements[ocr_ch] = []
+                char_replacements[ocr_ch].append(row["y"])
+
+            for ocr_ch, replacements in char_replacements.items():
+                counts = Counter(replacements)
+                total = sum(counts.values())
+                probs = [c / total for c in counts.values()]
+                entropy = -sum(p * np.log2(p) if p > 0 else 0 for p in probs)
+                self.char_entropy[ocr_ch] = entropy
+
+            print(f"Computed entropy for {len(self.char_entropy)} characters")
+
+        # Вычисление частот правил
+        if self.use_rule_freq and not pos_df.empty:
+            from collections import Counter
+
+            rule_counts = Counter(zip(pos_df["ocr"], pos_df["y"]))
+            for (ocr_ch, gt_ch), count in rule_counts.items():
+                self.rule_freq[(ocr_ch, gt_ch)] = np.log(count + 1)
+
+            print(f"Computed rule frequencies for {len(self.rule_freq)} rules")
+
+        # Обучение символьной языковой модели для beam search
+        if self.use_beam_search:
+            gt_words = df[df["ocr"] != df["gt"]]["gt"].tolist()
+            if gt_words:
+                self.char_lm = CharLM()
+                self.char_lm.fit(gt_words)
+                print(f"Trained CharLM on {len(gt_words)} GT words")
 
         # Объединяем
         train_df = pd.concat([pos_df, neg_df]).sample(
@@ -493,8 +696,144 @@ class CorrectorModel:
 
         return self
 
+    def _get_candidates_for_position(
+        self, ocr: str, pos: int
+    ) -> List[Tuple[str, float]]:
+        """Получить топ-K кандидатов для позиции с их вероятностями"""
+        ch = ocr[pos]
+        if not is_valid_symbol(ch):
+            return [(ch, 1.0)]
+
+        left = ocr[max(0, pos - self.context_size) : pos]
+        right = ocr[pos + 1 : pos + 1 + self.context_size]
+
+        feats = {f"ocr={ch}": 1}
+        for i, c in enumerate(left[::-1]):
+            if is_valid_symbol(c):
+                feats[f"L{i+1}={c}"] = 1
+        for i, c in enumerate(right):
+            if is_valid_symbol(c):
+                feats[f"R{i+1}={c}"] = 1
+
+        # Языковые признаки для beam search
+        if self.use_ngrams:
+            if len(left) > 0:
+                feats[f"bigram_L={left[-1]}{ch}"] = 1
+            if len(right) > 0:
+                feats[f"bigram_R={ch}{right[0]}"] = 1
+            if len(left) > 0 and len(right) > 0:
+                feats[f"trigram={left[-1]}{ch}{right[0]}"] = 1
+
+        pos_ratio = pos / max(len(ocr), 1)
+        feats["pos_ratio"] = pos_ratio
+        feats["is_start"] = 1 if pos == 0 else 0
+        feats["is_end"] = 1 if pos == len(ocr) - 1 else 0
+
+        # Морфемные зоны
+        if self.use_morpheme_zones:
+            feats["is_prefix_zone"] = 1 if pos_ratio < 0.3 else 0
+            feats["is_suffix_zone"] = 1 if pos_ratio > 0.6 else 0
+            feats["is_middle_zone"] = 1 if 0.3 <= pos_ratio <= 0.6 else 0
+
+        if self.use_entropy and ch in self.char_entropy:
+            feats["entropy"] = self.char_entropy[ch]
+
+        X = self.vec.transform([feats])
+        probs = self.clf.predict_proba(X)[0]
+
+        p_no = probs[self.no_change_idx]
+
+        candidates = [(ch, p_no, True)]  # (char, prob, is_no_change)
+
+        for cls, p in zip(self.classes, probs):
+            if cls == NO_CHANGE:
+                continue
+            if is_latin(cls):
+                continue
+            if p < self.prob_threshold:
+                continue
+            if p <= p_no * self.gate_k:
+                continue
+
+            candidates.append((cls, p, False))
+
+        # Сортируем по вероятности и берём топ-K
+        candidates.sort(key=lambda x: x[1], reverse=True)
+        return [(c[0], c[1], c[2]) for c in candidates[: self.top_k_candidates]]
+
+    def _beam_search_correct(self, ocr: str) -> Tuple[str, Optional[Dict]]:
+        """Beam Search коррекция слова с языковой моделью"""
+        from heapq import heappush, heappop
+
+        # Инициализация: начальная гипотеза
+        beam = [(0.0, ocr, [])]  # (model_score, word, edits)
+
+        for pos in range(len(ocr)):
+            new_beam = []
+
+            for model_score, word, edits in beam:
+                candidates = self._get_candidates_for_position(word, pos)
+
+                for new_char, prob, is_no_change in candidates:
+                    log_prob = np.log(prob + 1e-10)
+
+                    # Штраф для NO_CHANGE
+                    if is_no_change and self.no_change_penalty > 0:
+                        log_prob -= self.no_change_penalty
+
+                    new_model_score = model_score + log_prob
+
+                    if new_char != word[pos]:
+                        new_word = word[:pos] + new_char + word[pos + 1 :]
+                        new_edits = edits + [{"pos": pos, "char": new_char, "prob": prob}]
+                    else:
+                        new_word = word
+                        new_edits = edits
+
+                    heappush(new_beam, (-new_model_score, new_word, new_edits))
+
+            # Оставляем beam_size лучших
+            beam = []
+            seen = set()
+            while new_beam and len(beam) < self.beam_size:
+                neg_score, word, edits = heappop(new_beam)
+                if word not in seen:
+                    beam.append((-neg_score, word, edits))
+                    seen.add(word)
+
+        # Финальный скоринг с языковой моделью
+        if beam and self.char_lm and self.beam_lambda > 0:
+            scored_beam = []
+            for model_score, word, edits in beam:
+                lm_score = self.char_lm.log_prob_word(word)
+                # Combined score: model + lambda * LM
+                combined_score = model_score + self.beam_lambda * lm_score
+                scored_beam.append((combined_score, word, edits, model_score, lm_score))
+
+            # Сортируем по combined score
+            scored_beam.sort(key=lambda x: x[0], reverse=True)
+            best_combined, best_word, best_edits, best_model, best_lm = scored_beam[0]
+
+            if best_edits:
+                return best_word, {
+                    "edits": best_edits,
+                    "model_score": best_model,
+                    "lm_score": best_lm,
+                    "combined_score": best_combined,
+                }
+        elif beam:
+            # Без LM - просто лучший по model score
+            best_score, best_word, best_edits = beam[0]
+            if best_edits:
+                return best_word, {"edits": best_edits, "score": best_score}
+
+        return ocr, None
+
     def correct_word(self, ocr: str) -> Tuple[str, Optional[Dict]]:
         """Исправить одно слово"""
+        if self.use_beam_search:
+            return self._beam_search_correct(ocr)
+
         best = None
 
         for pos in range(len(ocr)):
@@ -592,10 +931,17 @@ class OCRCorrector:
         return df
 
     def build_gate_model(self, df: pd.DataFrame = None) -> GateModel:
-        """Построить Gate модель"""
+        """Построить Gate модель с train/valid split"""
         import warnings
+        from sklearn.model_selection import train_test_split
 
         df = df if df is not None else self.df
+
+        # Train/Valid split для честной оценки
+        valid_size = self.config.get("gate_valid_size", 0.2)
+        train_df, valid_df = train_test_split(
+            df, test_size=valid_size, random_state=self.config.get("random_state", 42)
+        )
 
         self.gate = GateModel(
             ngram_range=self.config["gate_ngram_range"],
@@ -608,14 +954,16 @@ class OCRCorrector:
 
         with warnings.catch_warnings():
             warnings.simplefilter("ignore")
-            self.gate.fit(df)
+            self.gate.fit(train_df)
 
-        stats = self.gate.get_stats(df)
+        # Оценка на валидационном датасете
+        stats = self.gate.get_stats(valid_df)
         print(f"Gate Model trained:")
-        print(f"  ROC-AUC: {stats['roc_auc']:.4f}")
+        print(f"  Train size: {len(train_df)}, Valid size: {len(valid_df)}")
+        print(f"  ROC-AUC (valid): {stats['roc_auc']:.4f}")
         print(f"  Threshold: {stats['threshold']:.4f}")
-        print(f"  Precision: {stats['precision']:.4f}")
-        print(f"  Recall: {stats['recall']:.4f}")
+        print(f"  Precision (valid): {stats['precision']:.4f}")
+        print(f"  Recall (valid): {stats['recall']:.4f}")
 
         return self.gate
 
@@ -631,6 +979,17 @@ class OCRCorrector:
             prob_threshold=self.config["corr_prob_threshold"],
             gate_k=self.config["corr_gate_k"],
             random_state=self.config["random_state"],
+            use_ngrams=self.config.get("corr_use_ngrams", True),
+            use_entropy=self.config.get("corr_use_entropy", True),
+            use_beam_search=self.config.get("corr_use_beam_search", False),
+            beam_size=self.config.get("corr_beam_size", 5),
+            beam_lambda=self.config.get("corr_beam_lambda", 0.1),
+            top_k_candidates=self.config.get("corr_top_k_candidates", 3),
+            # Новые параметры
+            gate_alpha=self.config.get("corr_gate_alpha", 0.5),
+            use_morpheme_zones=self.config.get("corr_use_morpheme_zones", True),
+            use_rule_freq=self.config.get("corr_use_rule_freq", True),
+            no_change_penalty=self.config.get("corr_no_change_penalty", 0.0),
         )
 
         self.corrector.fit(df)
@@ -679,6 +1038,30 @@ class OCRCorrector:
         # Corrector
         corrected, correction_info = self.corrector.correct_word(word)
         info["correction_info"] = correction_info
+
+        # Проверка gate_alpha: уверенность коррекции должна быть достаточной
+        # относительно уверенности gate
+        gate_alpha = self.config.get("corr_gate_alpha", 0.5)
+        if correction_info is not None and gate_alpha > 0:
+            # Получаем вероятность лучшей коррекции
+            if "edits" in correction_info and correction_info["edits"]:
+                # Beam search: берём среднюю вероятность правок
+                best_prob = sum(e["prob"] for e in correction_info["edits"]) / len(
+                    correction_info["edits"]
+                )
+            elif "prob" in correction_info:
+                # Обычный режим
+                best_prob = correction_info["prob"]
+            else:
+                best_prob = 1.0
+
+            # Если коррекция недостаточно уверена относительно gate - отклоняем
+            if best_prob < gate_alpha * gate_prob:
+                info["correction_rejected"] = True
+                info["rejection_reason"] = (
+                    f"best_prob={best_prob:.3f} < gate_alpha*gate_prob={gate_alpha * gate_prob:.3f}"
+                )
+                return word, info
 
         return corrected, info
 
@@ -872,6 +1255,7 @@ def optuna_optimize(config_base: Dict = None, n_trials: int = 100):
             "gate_ngram_range", [(1, 2), (1, 3), (2, 3)]
         )
         config["gate_min_df"] = trial.suggest_int("gate_min_df", 2, 10)
+        config["gate_valid_size"] = trial.suggest_float("gate_valid_size", 0.1, 0.3)
 
         # === Corrector параметры ===
         config["corr_prob_threshold"] = trial.suggest_float(
@@ -883,6 +1267,37 @@ def optuna_optimize(config_base: Dict = None, n_trials: int = 100):
             "corr_negative_ratio", 1.0, 5.0
         )
         config["corr_context_size"] = trial.suggest_int("corr_context_size", 1, 4)
+
+        # === Новые параметры ===
+        config["corr_use_ngrams"] = trial.suggest_categorical(
+            "corr_use_ngrams", [True, False]
+        )
+        config["corr_use_entropy"] = trial.suggest_categorical(
+            "corr_use_entropy", [True, False]
+        )
+        config["corr_use_morpheme_zones"] = trial.suggest_categorical(
+            "corr_use_morpheme_zones", [True, False]
+        )
+        config["corr_use_rule_freq"] = trial.suggest_categorical(
+            "corr_use_rule_freq", [True, False]
+        )
+        config["corr_gate_alpha"] = trial.suggest_float("corr_gate_alpha", 0.0, 1.0)
+        config["corr_no_change_penalty"] = trial.suggest_float(
+            "corr_no_change_penalty", 0.0, 1.0
+        )
+
+        # === Beam search параметры ===
+        config["corr_use_beam_search"] = trial.suggest_categorical(
+            "corr_use_beam_search", [True, False]
+        )
+        if config["corr_use_beam_search"]:
+            config["corr_beam_size"] = trial.suggest_int("corr_beam_size", 3, 10)
+            config["corr_beam_lambda"] = trial.suggest_float(
+                "corr_beam_lambda", 0.0, 1.0
+            )
+            config["corr_top_k_candidates"] = trial.suggest_int(
+                "corr_top_k_candidates", 2, 5
+            )
 
         try:
             corr = OCRCorrector(config)

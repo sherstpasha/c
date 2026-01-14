@@ -1,6 +1,21 @@
 """
-Simple OCR Corrector: только правила + модель-предиктор
-Без Gate модели. Модель можно выбрать: LogisticRegression, RandomForest, GradientBoosting
+Simple OCR Corrector: только правила + LogisticRegression
+Без Gate модели. Используется только логистическая регрессия.
+
+Возможности:
+1. Языковые признаки (use_ngrams, use_entropy):
+   - Биграммы слева/справа от символа
+   - Триграммы (символ с контекстом)
+   - Энтропия символа (сколько вариантов замен)
+
+2. Beam Search (use_beam_search):
+   - Рассматривает несколько кандидатов на каждой позиции
+   - Может делать несколько замен в одном слове
+   - Параметры: beam_size, beam_lambda, top_k_candidates
+
+Запуск:
+  python simple_corrector.py              # обычный режим
+  python simple_corrector.py optuna 50    # оптимизация Optuna
 """
 
 import pandas as pd
@@ -13,8 +28,8 @@ import warnings
 from typing import List, Dict, Tuple, Optional
 from sklearn.feature_extraction import DictVectorizer
 from sklearn.linear_model import LogisticRegression
-from sklearn.ensemble import RandomForestClassifier, GradientBoostingClassifier
 from sklearn.metrics import classification_report
+from joblib import Parallel, delayed
 
 
 # ======================================================
@@ -28,26 +43,26 @@ CONFIG = {
     "gt_column": "correct",
     "image_column": "image",
     # === Модель ===
-    "model_type": "logistic",  # "logistic", "random_forest", "gradient_boosting"
+    "model_type": "logistic",
     # === LogisticRegression параметры ===
     "lr_C": 1.0,
     "lr_max_iter": 300,
-    # === RandomForest параметры ===
-    "rf_n_estimators": 100,
-    "rf_max_depth": 10,
-    "rf_min_samples_split": 5,
-    "rf_min_samples_leaf": 2,
-    # === GradientBoosting параметры ===
-    "gb_n_estimators": 100,
-    "gb_max_depth": 5,
-    "gb_learning_rate": 0.1,
-    "gb_min_samples_split": 5,
     # === Corrector параметры ===
     "context_size": 2,
     "min_rule_freq": 3,
     "negative_ratio": 2.0,
     "prob_threshold": 0.5,
     "gate_k": 2.0,  # p_change > p_no_change * gate_k
+    # === Языковые признаки ===
+    "use_ngrams": True,  # биграммы и триграммы
+    "use_entropy": True,  # энтропия символа
+    # === Beam Search ===
+    "use_beam_search": False,  # включить beam search
+    "beam_size": 5,  # размер beam
+    "beam_lambda": 0.1,  # вес языковой модели
+    "top_k_candidates": 3,  # топ-K кандидатов на позицию
+    # === Parallelism ===
+    "n_jobs": 1,
     # === Общие ===
     "random_state": 42,
 }
@@ -113,6 +128,9 @@ class SimpleCorrector:
         self.classes = None
         self.no_change_idx = None
         self.df = None
+        
+        # Статистика для энтропии символов
+        self.char_entropy = {}  # ocr_char -> entropy
 
     def load_data(self, data_path: str = None) -> pd.DataFrame:
         """Загрузить данные"""
@@ -231,54 +249,79 @@ class SimpleCorrector:
 
     def _make_features(self, row) -> Dict:
         """Создать признаки для одного примера"""
-        feats = {f"ocr={row['ocr']}": 1}
+        ch = row['ocr']
+        left = row['left']
+        right = row['right']
+        
+        feats = {f"ocr={ch}": 1}
 
         # Контекст слева
-        for i, ch in enumerate(row["left"][::-1]):
-            if is_valid_symbol(ch):
-                feats[f"L{i+1}={ch}"] = 1
+        for i, c in enumerate(left[::-1]):
+            if is_valid_symbol(c):
+                feats[f"L{i+1}={c}"] = 1
 
         # Контекст справа
-        for i, ch in enumerate(row["right"]):
-            if is_valid_symbol(ch):
-                feats[f"R{i+1}={ch}"] = 1
+        for i, c in enumerate(right):
+            if is_valid_symbol(c):
+                feats[f"R{i+1}={c}"] = 1
 
         # Позиционные признаки
         feats["pos_ratio"] = row["pos_in_word"] / max(row["word_len"], 1)
         feats["is_start"] = 1 if row["pos_in_word"] == 0 else 0
         feats["is_end"] = 1 if row["pos_in_word"] == row["word_len"] - 1 else 0
 
+        # === ЯЗЫКОВЫЕ ПРИЗНАКИ ===
+        if self.config.get("use_ngrams", True):
+            # Биграммы
+            if len(left) > 0 and is_valid_symbol(left[-1]):
+                feats[f"bigram_L={left[-1]}{ch}"] = 1
+            if len(right) > 0 and is_valid_symbol(right[0]):
+                feats[f"bigram_R={ch}{right[0]}"] = 1
+            
+            # Триграммы
+            if len(left) > 0 and len(right) > 0:
+                if is_valid_symbol(left[-1]) and is_valid_symbol(right[0]):
+                    feats[f"trigram={left[-1]}{ch}{right[0]}"] = 1
+
+        # === ЭНТРОПИЯ СИМВОЛА ===
+        if self.config.get("use_entropy", True):
+            entropy = self.char_entropy.get(ch, 0.0)
+            feats["ocr_entropy"] = entropy
+
         return feats
 
     def _create_model(self):
         """Создать модель по конфигу"""
-        model_type = self.config["model_type"]
+        return LogisticRegression(
+            C=self.config["lr_C"],
+            max_iter=self.config["lr_max_iter"],
+            random_state=self.config["random_state"],
+        )
 
-        if model_type == "logistic":
-            return LogisticRegression(
-                C=self.config["lr_C"],
-                max_iter=self.config["lr_max_iter"],
-                random_state=self.config["random_state"],
-            )
-        elif model_type == "random_forest":
-            return RandomForestClassifier(
-                n_estimators=self.config["rf_n_estimators"],
-                max_depth=self.config["rf_max_depth"],
-                min_samples_split=self.config["rf_min_samples_split"],
-                min_samples_leaf=self.config["rf_min_samples_leaf"],
-                random_state=self.config["random_state"],
-                n_jobs=-1,
-            )
-        elif model_type == "gradient_boosting":
-            return GradientBoostingClassifier(
-                n_estimators=self.config["gb_n_estimators"],
-                max_depth=self.config["gb_max_depth"],
-                learning_rate=self.config["gb_learning_rate"],
-                min_samples_split=self.config["gb_min_samples_split"],
-                random_state=self.config["random_state"],
-            )
-        else:
-            raise ValueError(f"Unknown model_type: {model_type}")
+    def _compute_char_entropy(self, pos_df: pd.DataFrame):
+        """Вычислить энтропию для каждого OCR символа"""
+        from collections import defaultdict
+        
+        char_replacements = defaultdict(lambda: defaultdict(int))
+        
+        # Подсчитываем частоты замен
+        for _, row in pos_df.iterrows():
+            ocr_ch = row['ocr']
+            y_ch = row['y']
+            char_replacements[ocr_ch][y_ch] += 1
+        
+        # Вычисляем энтропию
+        self.char_entropy = {}
+        for ocr_ch, replacements in char_replacements.items():
+            total = sum(replacements.values())
+            entropy = 0.0
+            for count in replacements.values():
+                p = count / total
+                if p > 0:
+                    entropy -= p * np.log2(p)
+            self.char_entropy[ocr_ch] = entropy
+        
+        print(f"Computed entropy for {len(self.char_entropy)} characters")
 
     def fit(self, df: pd.DataFrame = None) -> "SimpleCorrector":
         """Обучить модель"""
@@ -287,6 +330,10 @@ class SimpleCorrector:
         # Positive samples
         pos_df = self._extract_positive_samples(df)
         print(f"Positive samples: {len(pos_df)}")
+        
+        # Вычисляем энтропию символов
+        if self.config.get("use_entropy", True):
+            self._compute_char_entropy(pos_df)
 
         # Negative samples
         neg_df = self._extract_negative_samples(df, len(pos_df))
@@ -321,8 +368,117 @@ class SimpleCorrector:
 
         return self
 
+    def _get_position_candidates(self, ocr: str, pos: int) -> List[Tuple[str, float]]:
+        """Получить топ-K кандидатов для позиции"""
+        ctx = self.config["context_size"]
+        prob_threshold = self.config["prob_threshold"]
+        gate_k = self.config["gate_k"]
+        top_k = self.config.get("top_k_candidates", 3)
+
+        ch = ocr[pos]
+        if not is_valid_symbol(ch):
+            return [(ch, 1.0)]  # NO_CHANGE с вероятностью 1
+
+        left = ocr[max(0, pos - ctx) : pos]
+        right = ocr[pos + 1 : pos + 1 + ctx]
+
+        # Формируем признаки (с учётом новых фич)
+        feats = {f"ocr={ch}": 1}
+        for i, c in enumerate(left[::-1]):
+            if is_valid_symbol(c):
+                feats[f"L{i+1}={c}"] = 1
+        for i, c in enumerate(right):
+            if is_valid_symbol(c):
+                feats[f"R{i+1}={c}"] = 1
+
+        feats["pos_ratio"] = pos / max(len(ocr), 1)
+        feats["is_start"] = 1 if pos == 0 else 0
+        feats["is_end"] = 1 if pos == len(ocr) - 1 else 0
+
+        # N-граммы
+        if self.config.get("use_ngrams", True):
+            if len(left) > 0 and is_valid_symbol(left[-1]):
+                feats[f"bigram_L={left[-1]}{ch}"] = 1
+            if len(right) > 0 and is_valid_symbol(right[0]):
+                feats[f"bigram_R={ch}{right[0]}"] = 1
+            if len(left) > 0 and len(right) > 0:
+                if is_valid_symbol(left[-1]) and is_valid_symbol(right[0]):
+                    feats[f"trigram={left[-1]}{ch}{right[0]}"] = 1
+
+        # Энтропия
+        if self.config.get("use_entropy", True):
+            entropy = self.char_entropy.get(ch, 0.0)
+            feats["ocr_entropy"] = entropy
+
+        X = self.vec.transform([feats])
+        probs = self.clf.predict_proba(X)[0]
+
+        p_no = probs[self.no_change_idx]
+
+        candidates = [(ch, p_no)]  # NO_CHANGE всегда включаем
+
+        for cls, p in zip(self.classes, probs):
+            if cls == NO_CHANGE:
+                continue
+            if is_latin(cls):
+                continue
+
+            # Фильтрация
+            if p < prob_threshold:
+                continue
+            if p <= p_no * gate_k:
+                continue
+
+            candidates.append((cls, p))
+
+        # Сортируем по вероятности и берём топ-K
+        candidates.sort(key=lambda x: x[1], reverse=True)
+        return candidates[:top_k]
+
+    def _beam_search(self, ocr: str) -> Tuple[str, float]:
+        """Beam Search по символам слова"""
+        beam_size = self.config.get("beam_size", 5)
+        beam_lambda = self.config.get("beam_lambda", 0.1)
+
+        # Beam: [(word, log_prob)]
+        beam = [(ocr, 0.0)]
+
+        for pos in range(len(ocr)):
+            new_beam = []
+
+            for current_word, current_score in beam:
+                candidates = self._get_position_candidates(current_word, pos)
+
+                for new_char, prob in candidates:
+                    # Применяем замену
+                    new_word = current_word[:pos] + new_char + current_word[pos + 1:]
+                    
+                    # Считаем score
+                    log_prob = np.log(prob + 1e-10)
+                    new_score = current_score + log_prob
+
+                    # TODO: можно добавить языковую модель
+                    # new_score += beam_lambda * language_model_score(new_word)
+
+                    new_beam.append((new_word, new_score))
+
+            # Оставляем топ beam_size
+            new_beam.sort(key=lambda x: x[1], reverse=True)
+            beam = new_beam[:beam_size]
+
+        # Возвращаем лучший результат
+        best_word, best_score = beam[0]
+        return best_word, best_score
+
     def correct_word(self, ocr: str) -> Tuple[str, Optional[Dict]]:
         """Исправить одно слово"""
+        if self.config.get("use_beam_search", False):
+            corrected, score = self._beam_search(ocr)
+            if corrected != ocr:
+                return corrected, {"method": "beam_search", "score": score}
+            return ocr, None
+
+        # Старый greedy подход
         best = None
         ctx = self.config["context_size"]
         prob_threshold = self.config["prob_threshold"]
@@ -347,6 +503,21 @@ class SimpleCorrector:
             feats["pos_ratio"] = pos / max(len(ocr), 1)
             feats["is_start"] = 1 if pos == 0 else 0
             feats["is_end"] = 1 if pos == len(ocr) - 1 else 0
+            
+            # N-граммы
+            if self.config.get("use_ngrams", True):
+                if len(left) > 0 and is_valid_symbol(left[-1]):
+                    feats[f"bigram_L={left[-1]}{ch}"] = 1
+                if len(right) > 0 and is_valid_symbol(right[0]):
+                    feats[f"bigram_R={ch}{right[0]}"] = 1
+                if len(left) > 0 and len(right) > 0:
+                    if is_valid_symbol(left[-1]) and is_valid_symbol(right[0]):
+                        feats[f"trigram={left[-1]}{ch}{right[0]}"] = 1
+
+            # Энтропия
+            if self.config.get("use_entropy", True):
+                entropy = self.char_entropy.get(ch, 0.0)
+                feats["ocr_entropy"] = entropy
 
             X = self.vec.transform([feats])
             probs = self.clf.predict_proba(X)[0]
@@ -380,28 +551,39 @@ class SimpleCorrector:
 
         cer_metric = evaluate.load("cer")
 
-        refs, ocr_preds, corr_preds = [], [], []
-        applied, improved, worsened = 0, 0, 0
+        # parallelize per-row correction & scoring
+        n_jobs = self.config.get("n_jobs", 1)
 
-        for _, row in df.iterrows():
+        def _process_row(row):
             ocr = str(row["ocr"])
             gt = str(row["gt"])
-
             corrected, info = self.correct_word(ocr)
 
-            refs.append(gt)
-            ocr_preds.append(ocr)
-            corr_preds.append(corrected)
+            applied = 0
+            improved = 0
+            worsened = 0
 
             if info is not None:
-                applied += 1
+                applied = 1
                 dist_before = Levenshtein.distance(ocr, gt)
                 dist_after = Levenshtein.distance(corrected, gt)
-
                 if dist_after < dist_before:
-                    improved += 1
+                    improved = 1
                 elif dist_after > dist_before:
-                    worsened += 1
+                    worsened = 1
+
+            return gt, ocr, corrected, applied, improved, worsened
+
+        results = Parallel(n_jobs=n_jobs)(
+            delayed(_process_row)(row) for _, row in df.iterrows()
+        )
+
+        refs = [r[0] for r in results]
+        ocr_preds = [r[1] for r in results]
+        corr_preds = [r[2] for r in results]
+        applied = sum(r[3] for r in results)
+        improved = sum(r[4] for r in results)
+        worsened = sum(r[5] for r in results)
 
         cer_before = cer_metric.compute(predictions=ocr_preds, references=refs)
         cer_after = cer_metric.compute(predictions=corr_preds, references=refs)
@@ -459,7 +641,7 @@ class SimpleCorrector:
 # ======================================================
 
 
-def optuna_optimize(config_base: Dict = None, n_trials: int = 100):
+def optuna_optimize(config_base: Dict = None, n_trials: int = 100, n_jobs: int = 1):
     """Optuna оптимизация"""
     import optuna
 
@@ -475,35 +657,9 @@ def optuna_optimize(config_base: Dict = None, n_trials: int = 100):
     def objective(trial):
         config = config_base.copy()
 
-        # === Выбор модели ===
-        config["model_type"] = trial.suggest_categorical(
-            "model_type", ["logistic", "random_forest", "gradient_boosting"]
-        )
-
-        # === Параметры по типу модели ===
-        if config["model_type"] == "logistic":
-            config["lr_C"] = trial.suggest_float("lr_C", 0.01, 10.0, log=True)
-            config["lr_max_iter"] = trial.suggest_int("lr_max_iter", 100, 500)
-
-        elif config["model_type"] == "random_forest":
-            config["rf_n_estimators"] = trial.suggest_int("rf_n_estimators", 50, 300)
-            config["rf_max_depth"] = trial.suggest_int("rf_max_depth", 3, 20)
-            config["rf_min_samples_split"] = trial.suggest_int(
-                "rf_min_samples_split", 2, 20
-            )
-            config["rf_min_samples_leaf"] = trial.suggest_int(
-                "rf_min_samples_leaf", 1, 10
-            )
-
-        elif config["model_type"] == "gradient_boosting":
-            config["gb_n_estimators"] = trial.suggest_int("gb_n_estimators", 50, 300)
-            config["gb_max_depth"] = trial.suggest_int("gb_max_depth", 2, 10)
-            config["gb_learning_rate"] = trial.suggest_float(
-                "gb_learning_rate", 0.01, 0.3, log=True
-            )
-            config["gb_min_samples_split"] = trial.suggest_int(
-                "gb_min_samples_split", 2, 20
-            )
+        # === Параметры LogisticRegression ===
+        config["lr_C"] = trial.suggest_float("lr_C", 0.01, 10.0, log=True)
+        config["lr_max_iter"] = trial.suggest_int("lr_max_iter", 100, 500)
 
         # === Общие параметры корректора ===
         config["context_size"] = trial.suggest_int("context_size", 1, 4)
@@ -511,6 +667,17 @@ def optuna_optimize(config_base: Dict = None, n_trials: int = 100):
         config["negative_ratio"] = trial.suggest_float("negative_ratio", 1.0, 5.0)
         config["prob_threshold"] = trial.suggest_float("prob_threshold", 0.2, 0.8)
         config["gate_k"] = trial.suggest_float("gate_k", 0.5, 10.0)
+
+        # === Языковые признаки ===
+        config["use_ngrams"] = trial.suggest_categorical("use_ngrams", [True, False])
+        config["use_entropy"] = trial.suggest_categorical("use_entropy", [True, False])
+
+        # === Beam Search ===
+        config["use_beam_search"] = trial.suggest_categorical("use_beam_search", [True, False])
+        if config["use_beam_search"]:
+            config["beam_size"] = trial.suggest_int("beam_size", 3, 10)
+            config["beam_lambda"] = trial.suggest_float("beam_lambda", 0.0, 1.0)
+            config["top_k_candidates"] = trial.suggest_int("top_k_candidates", 2, 5)
 
         try:
             import io, sys
@@ -534,7 +701,6 @@ def optuna_optimize(config_base: Dict = None, n_trials: int = 100):
             # Score: precision с бонусом за количество
             score = precision * min(1.0, applied / 50)
 
-            trial.set_user_attr("model_type", config["model_type"])
             trial.set_user_attr("precision", precision)
             trial.set_user_attr("applied", applied)
             trial.set_user_attr("improved", result["improved"])
@@ -551,7 +717,11 @@ def optuna_optimize(config_base: Dict = None, n_trials: int = 100):
     print("=" * 70)
 
     study = optuna.create_study(direction="maximize")
-    study.optimize(objective, n_trials=n_trials, show_progress_bar=True)
+    # run trials in parallel if n_jobs > 1
+    if n_jobs and int(n_jobs) > 1:
+        study.optimize(objective, n_trials=n_trials, n_jobs=int(n_jobs), show_progress_bar=True)
+    else:
+        study.optimize(objective, n_trials=n_trials, show_progress_bar=True)
 
     # Результаты
     print("\n" + "=" * 70)
@@ -565,7 +735,6 @@ def optuna_optimize(config_base: Dict = None, n_trials: int = 100):
         print(f"  {key}: {value}")
 
     print(f"\n=== BEST TRIAL METRICS ===")
-    print(f"  Model: {best.user_attrs.get('model_type', 'N/A')}")
     print(f"  Precision: {best.user_attrs.get('precision', 0):.4f}")
     print(f"  Applied: {best.user_attrs.get('applied', 0)}")
     print(f"  Improved: {best.user_attrs.get('improved', 0)}")
@@ -578,192 +747,10 @@ def optuna_optimize(config_base: Dict = None, n_trials: int = 100):
     trials_df.to_csv("simple_optuna_trials.csv", index=False)
     print(f"\nTrials saved to: simple_optuna_trials.csv")
 
-    # ТОП по моделям
-    print("\n=== TOP BY MODEL TYPE ===")
-    for model_type in ["logistic", "random_forest", "gradient_boosting"]:
-        model_trials = [
-            t
-            for t in study.trials
-            if t.user_attrs.get("model_type") == model_type and t.value
-        ]
-        if model_trials:
-            best_model = max(model_trials, key=lambda t: t.value)
-            print(
-                f"  {model_type}: score={best_model.value:.4f}, "
-                f"precision={best_model.user_attrs.get('precision', 0):.4f}, "
-                f"applied={best_model.user_attrs.get('applied', 0)}"
-            )
-
     best_config = config_base.copy()
     best_config.update(best.params)
 
     return study, best_config
-
-
-# ======================================================
-# GRID SEARCH (Полный перебор)
-# ======================================================
-
-
-def grid_search_full():
-    """Полный перебор всех комбинаций параметров"""
-    from itertools import product
-
-    config_base = CONFIG.copy()
-
-    # Загружаем данные
-    corr = SimpleCorrector(config_base)
-    df = corr.load_data()
-    print(f"Loaded {len(df)} word pairs\n")
-
-    # === ПОЛНАЯ СЕТКА ПАРАМЕТРОВ ===
-    param_grid = {
-        "model_type": ["logistic", "random_forest", "gradient_boosting"],
-        # Общие параметры
-        "context_size": [1, 2, 3, 4],
-        "min_rule_freq": [2, 3, 5, 10],
-        "negative_ratio": [1.0, 1.5, 2.0, 3.0, 5.0],
-        "prob_threshold": [0.2, 0.3, 0.4, 0.5, 0.6, 0.7, 0.8],
-        "gate_k": [0.5, 1.0, 1.5, 2.0, 3.0, 5.0, 10.0],
-        # LogisticRegression
-        "lr_C": [0.01, 0.1, 1.0, 10.0, 100.0],
-        "lr_max_iter": [100, 300, 500],
-        # RandomForest
-        "rf_n_estimators": [50, 100, 200],
-        "rf_max_depth": [5, 10, 15, None],
-        "rf_min_samples_split": [2, 5, 10],
-        "rf_min_samples_leaf": [1, 2, 5],
-        # GradientBoosting
-        "gb_n_estimators": [50, 100, 200],
-        "gb_max_depth": [3, 5, 7],
-        "gb_learning_rate": [0.01, 0.05, 0.1, 0.3],
-        "gb_min_samples_split": [2, 5, 10],
-    }
-
-    # Генерируем комбинации с учётом модели
-    all_results = []
-
-    for model_type in param_grid["model_type"]:
-        # Общие параметры
-        common_keys = [
-            "context_size",
-            "min_rule_freq",
-            "negative_ratio",
-            "prob_threshold",
-            "gate_k",
-        ]
-
-        # Параметры конкретной модели
-        if model_type == "logistic":
-            model_keys = ["lr_C", "lr_max_iter"]
-        elif model_type == "random_forest":
-            model_keys = [
-                "rf_n_estimators",
-                "rf_max_depth",
-                "rf_min_samples_split",
-                "rf_min_samples_leaf",
-            ]
-        else:  # gradient_boosting
-            model_keys = [
-                "gb_n_estimators",
-                "gb_max_depth",
-                "gb_learning_rate",
-                "gb_min_samples_split",
-            ]
-
-        all_keys = ["model_type"] + common_keys + model_keys
-        all_values = [[model_type]] + [param_grid[k] for k in common_keys + model_keys]
-
-        combinations = list(product(*all_values))
-
-        print(f"\n{model_type}: {len(combinations)} combinations")
-
-        for i, combo in enumerate(combinations):
-            config = config_base.copy()
-
-            # Заполняем конфиг
-            for key, value in zip(all_keys, combo):
-                config[key] = value
-
-            try:
-                corr = SimpleCorrector(config)
-                corr.df = df
-                corr.fit(df)
-
-                eval_result = corr.evaluate(df)
-
-                result = {
-                    **{k: v for k, v in zip(all_keys, combo)},
-                    "precision": eval_result["precision"],
-                    "improved": eval_result["improved"],
-                    "worsened": eval_result["worsened"],
-                    "applied": eval_result["corrections_applied"],
-                    "cer_delta": eval_result["cer_delta"],
-                    "acc_delta": eval_result["acc_delta"],
-                    "score": eval_result["precision"]
-                    * min(1.0, eval_result["corrections_applied"] / 50),
-                }
-
-                all_results.append(result)
-
-                # Прогресс
-                if (i + 1) % 50 == 0:
-                    best_score = max([r["score"] for r in all_results])
-                    print(
-                        f"  Progress: {i + 1}/{len(combinations)}, best_score={best_score:.4f}"
-                    )
-
-            except Exception as e:
-                print(f"  Error at combo {i}: {e}")
-                continue
-
-    # Сохраняем результаты
-    results_df = pd.DataFrame(all_results)
-    results_df = results_df.sort_values("score", ascending=False)
-    results_df.to_csv("simple_corrector_grid_full.csv", index=False)
-
-    print("\n" + "=" * 70)
-    print("GRID SEARCH COMPLETE")
-    print("=" * 70)
-    print(f"\nTotal combinations tested: {len(results_df)}")
-    print(f"Results saved to: simple_corrector_grid_full.csv")
-
-    # Лучший результат
-    best = results_df.iloc[0]
-    print("\n=== BEST CONFIGURATION ===")
-    for key in results_df.columns:
-        if key not in [
-            "score",
-            "precision",
-            "improved",
-            "worsened",
-            "applied",
-            "cer_delta",
-            "acc_delta",
-        ]:
-            print(f"  {key}: {best[key]}")
-
-    print("\n=== BEST METRICS ===")
-    print(f"  Score: {best['score']:.4f}")
-    print(f"  Precision: {best['precision']:.4f}")
-    print(f"  Applied: {best['applied']}")
-    print(f"  Improved: {best['improved']}")
-    print(f"  Worsened: {best['worsened']}")
-    print(f"  CER delta: {best['cer_delta']:.6f}")
-    print(f"  Acc delta: {best['acc_delta']:.6f}")
-
-    # ТОП-20 по каждой модели
-    print("\n=== TOP 20 BY MODEL ===")
-    for model in ["logistic", "random_forest", "gradient_boosting"]:
-        print(f"\n{model}:")
-        top = results_df[results_df["model_type"] == model].head(20)
-        for i, row in top.iterrows():
-            print(
-                f"  {len(top) - len(top) + list(top.index).index(i) + 1}. score={row['score']:.4f}, "
-                f"prec={row['precision']:.4f}, applied={row['applied']}"
-            )
-
-    return results_df
 
 
 # ======================================================
@@ -773,13 +760,10 @@ def grid_search_full():
 if __name__ == "__main__":
     import sys
 
-    if len(sys.argv) > 1 and sys.argv[1] == "grid":
-        # Полный перебор
-        results_df = grid_search_full()
-
-    elif len(sys.argv) > 1 and sys.argv[1] == "optuna":
+    if len(sys.argv) > 1 and sys.argv[1] == "optuna":
         n_trials = int(sys.argv[2]) if len(sys.argv) > 2 else 100
-        study, best_config = optuna_optimize(n_trials=n_trials)
+        n_jobs = int(sys.argv[3]) if len(sys.argv) > 3 else CONFIG.get("n_jobs", 1)
+        study, best_config = optuna_optimize(n_trials=n_trials, n_jobs=n_jobs)
 
         print("\n" + "=" * 70)
         print("RUNNING WITH BEST PARAMETERS")
@@ -792,13 +776,8 @@ if __name__ == "__main__":
         corr.print_evaluation(result)
 
     else:
-        # Обычный режим - можно задать модель через аргумент
+        # Обычный режим
         config = CONFIG.copy()
-
-        if len(sys.argv) > 1:
-            config["model_type"] = sys.argv[
-                1
-            ]  # logistic, random_forest, gradient_boosting
 
         corr = SimpleCorrector(config)
         df = corr.load_data()
