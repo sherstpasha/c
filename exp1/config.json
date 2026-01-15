@@ -4,43 +4,127 @@
   "text_path": "extracted_texts_cleaned.txt",
   "charset_path": "charset.txt",
   "pairs_path": "pairs.csv",
+  "max_lexicon_words": 300000,
   "max_len": 64,
   "emb_size": 256,
   "n_layers": 6,
   "n_heads": 8,
   "ffn_size": 1024,
   "dropout": 0.1,
-  "batch_a": 256,
+  "embed_dim": 256,
+  "batch_a": 128,
   "epochs_a": 30,
-  "lr_a": 0.001,
-  "split_prob_a": 0.03,
-  "batch_b": 256,
+  "lr_encoder_a": 0.001,
+  "lr_embed_head_a": 0.003,
+  "mlm_weight_a": 0.3,
+  "metric_weight_a": 1.0,
+  "noise_prob_a": 0.5,
+  "freeze_encoder_a_epochs": 2,
+  "batch_b": 128,
   "epochs_b": 30,
-  "lr_b": 1e-05,
-  "steps_per_epoch_b": 12000,
+  "steps_per_epoch_b": 10000,
+  "lr_encoder_b": 1e-05,
+  "lr_embed_head_b": 0.0003,
+  "mlm_weight_b": 0.1,
+  "metric_weight_b": 1.0,
+  "context_noise_prob": 0.3,
   "batch_c": 64,
-  "epochs_c": 10,
-  "lr_c": 1e-06,
-  "p_win_1_c": 0.4,
-  "p_win_2_c": 0.3,
-  "p_win_3_c": 0.3,
-  "min_word_len": 4,
-  "mask_prob": 0.95,
-  "span_min": 1,
-  "span_max": 3,
-  "num_spans_min": 1,
-  "num_spans_max": 2,
-  "p_win_1": 0.35,
-  "p_win_2": 0.25,
-  "p_win_3": 0.4,
-  "p_swap": 0.05,
-  "p_delete": 0.03,
-  "p_insert_space": 0.03,
-  "p_duplicate": 0.01,
+  "epochs_c": 20,
+  "lr_encoder_c": 5e-06,
+  "lr_embed_head_c": 0.0001,
+  "mlm_weight_c": 0.05,
+  "metric_weight_c": 1.0,
+  "hard_neg_k": 10,
+  "update_lexicon_emb_every": 3,
+  "temperature": 0.07,
+  "p_char_insert": 0.08,
+  "p_char_delete": 0.08,
+  "p_char_substitute": 0.12,
+  "p_char_swap": 0.05,
+  "p_space_insert": 0.05,
+  "p_duplicate": 0.03,
+  "confusables": {
+    "о": [
+      "а",
+      "0"
+    ],
+    "а": [
+      "о"
+    ],
+    "е": [
+      "ё",
+      "с"
+    ],
+    "ё": [
+      "е"
+    ],
+    "и": [
+      "й",
+      "п"
+    ],
+    "й": [
+      "и"
+    ],
+    "п": [
+      "г",
+      "н"
+    ],
+    "г": [
+      "п",
+      "т"
+    ],
+    "н": [
+      "м",
+      "и"
+    ],
+    "м": [
+      "н",
+      "ш"
+    ],
+    "ь": [
+      "ъ"
+    ],
+    "ъ": [
+      "ь"
+    ],
+    "ш": [
+      "щ"
+    ],
+    "щ": [
+      "ш"
+    ],
+    "ц": [
+      "у"
+    ],
+    "у": [
+      "ц"
+    ],
+    "б": [
+      "в"
+    ],
+    "в": [
+      "б"
+    ],
+    "ѣ": [
+      "е"
+    ],
+    "і": [
+      "и",
+      "1"
+    ]
+  },
+  "min_word_len": 3,
+  "mask_prob": 0.15,
+  "p_win_1": 0.4,
+  "p_win_2": 0.3,
+  "p_win_3": 0.3,
   "grad_clip": 1.0,
   "weight_decay": 0.01,
-  "warmup_steps": 500,
-  "use_scheduler": true,
+  "warmup_ratio": 0.1,
   "device": "cuda",
-  "seed": 42
+  "seed": 42,
+  "num_workers": 0,
+  "n_negatives_a": 15,
+  "metric_loss_type": "infonce",
+  "triplet_margin": 0.3
 }
