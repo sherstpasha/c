@@ -1,0 +1,42 @@
+{
+  "data": {
+    "lexicon_path": "all_words.txt",
+    "text_path": "extracted_texts_cleaned.txt",
+    "vocab_path": "char_mlm_vocab1.json",
+    "min_word_len": 4,
+    "token_regex": "[А-Яа-яЁёІіѢѣѲѳЪъ]+"
+  },
+  "model": {
+    "max_len": 64,
+    "emb_size": 256,
+    "n_layers": 6,
+    "n_heads": 8,
+    "ffn_size": 1024,
+    "dropout": 0.1
+  },
+  "masking": {
+    "mask_prob": 0.95,
+    "span_min": 1,
+    "span_max": 3,
+    "num_spans_min": 1,
+    "num_spans_max": 2,
+    "split_word_prob": 0.15
+  },
+  "training": {
+    "batch_size_a": 256,
+    "epochs_a": 30,
+    "lr_a": 0.001,
+    "batch_size_b": 256,
+    "epochs_b": 24,
+    "lr_b": 1e-05,
+    "steps_per_epoch_b": 12000,
+    "p_win_1": 0.35,
+    "p_win_2": 0.25,
+    "p_win_3": 0.4,
+    "device": "cuda",
+    "seed": 42,
+    "checkpoint_path": "char_mlm_transformer1.pt",
+    "log_path": "training_log.txt",
+    "patience": 5
+  }
+}
