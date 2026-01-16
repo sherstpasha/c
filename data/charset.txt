@@ -1,6 +1,8 @@
 <PAD>
 <SOS>
 <EOS>
+<EOW>
+<SEP>
  
 a
 b
