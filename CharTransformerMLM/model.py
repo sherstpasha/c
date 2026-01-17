@@ -14,12 +14,16 @@ class CharTransformerMLM(nn.Module):
         dropout: float = 0.1,
         pad_idx: int = 0,
         eow_idx: int = 1,
+        ins_idx: int = 5,
+        space_idx: int = 6,
         copy_strength: float = 6.0,
     ):
         super().__init__()
 
         self.pad_idx = pad_idx
         self.eow_idx = eow_idx
+        self.ins_idx = ins_idx
+        self.space_idx = space_idx
         self.emb_size = emb_size
         self.copy_strength = copy_strength
 
@@ -69,11 +73,24 @@ class CharTransformerMLM(nn.Module):
             copy_mask = y == -100  # [B, T]
             copy_bias = torch.zeros_like(logits)
 
+            # Для обычных токенов - копируем вход
             copy_bias.scatter_(
                 -1,
                 x.unsqueeze(-1),
                 1.0,
             )
+
+            # Для <INS> токенов - bias к пробелу (по умолчанию "ничего не делать")
+            ins_mask = (x == self.ins_idx) & copy_mask  # [B, T]
+            if ins_mask.any():
+                # Устанавливаем bias к пробелу для позиций <INS>
+                copy_bias[:, :, self.space_idx] = (
+                    copy_bias[:, :, self.space_idx] + ins_mask.float()
+                )
+                # Убираем bias к самому <INS>
+                copy_bias[:, :, self.ins_idx] = (
+                    copy_bias[:, :, self.ins_idx] * (~ins_mask).float()
+                )
 
             logits = logits + self.copy_strength * copy_bias * copy_mask.unsqueeze(-1)
 

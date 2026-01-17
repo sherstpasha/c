@@ -12,7 +12,7 @@ from CharTransformerMLM.vocab import CharVocab
 
 
 # Пути по умолчанию
-DEFAULT_CHECKPOINT = "checkpoints1/best.pt"
+DEFAULT_CHECKPOINT = "checkpoints/best.pt"
 DEFAULT_CHARSET = "data/charset.txt"
 DEFAULT_WORDS = "data/all_words.txt"
 
@@ -78,7 +78,16 @@ class OCRDenoiser:
 
         # Загрузка модели
         ckpt = torch.load(checkpoint_path, map_location=self.device)
-        config = ckpt.get("config", {})
+
+        # Проверяем формат чекпоинта
+        if isinstance(ckpt, dict) and "model" in ckpt:
+            # Полный чекпоинт с конфигом
+            state_dict = ckpt["model"]
+            config = ckpt.get("config", {})
+        else:
+            # Только веса (OrderedDict)
+            state_dict = ckpt
+            config = {}  # Используем дефолтные значения
 
         self.model = CharTransformerMLM(
             vocab_size=len(self.vocab.token_to_id),
@@ -86,12 +95,14 @@ class OCRDenoiser:
             n_layers=config.get("n_layers", 6),
             n_heads=config.get("n_heads", 6),
             ffn_size=config.get("ffn_size", 768),
-            dropout=0.0,  # При инференсе dropout=0
+            dropout=0.0,
             pad_idx=self.vocab.pad,
             eow_idx=self.vocab.eow,
+            ins_idx=self.vocab.ins,
+            space_idx=self.vocab.token_to_id.get(" ", 6),
         ).to(self.device)
 
-        self.model.load_state_dict(ckpt["model"])
+        self.model.load_state_dict(state_dict)
         self.model.eval()
 
         print(f"Модель загружена: {checkpoint_path}")
@@ -106,7 +117,7 @@ class OCRDenoiser:
         if not words:
             return text, []
 
-        # Кодируем: слово + EOW для каждого
+        # Кодируем: слово + <INS> + <EOW> для каждого
         ids = []
         word_boundaries = []
 
@@ -114,6 +125,7 @@ class OCRDenoiser:
             start = len(ids)
             word_ids = self.vocab.encode(word)
             ids.extend(word_ids)
+            ids.append(self.vocab.ins)  # <INS> перед <EOW>
             ids.append(self.vocab.eow)
             word_boundaries.append((start, len(ids) - 1))
 
@@ -127,46 +139,64 @@ class OCRDenoiser:
         with torch.no_grad():
             logits, _ = self.model(x, y_dummy)
 
-            # Применяем маску EOW
+            # Применяем маски
             eow = self.vocab.eow
-            mask = (x != eow) & (y_dummy == -100)
+            ins = self.vocab.ins
+
+            # Запрещаем <EOW> на не-EOW позициях
+            mask = (x != eow) & (x != ins) & (y_dummy == -100)
             logits[..., eow] -= mask * 1e9
+
+            # Разрешаем только <EOW> на EOW позициях
             eow_positions = x == eow
             non_eow_mask = torch.ones_like(logits, dtype=torch.bool)
             non_eow_mask[..., eow] = False
             logits[eow_positions.unsqueeze(-1).expand_as(logits) & non_eow_mask] -= 1e9
+
+            # <INS> никогда не должен быть выходным символом
+            logits[..., ins] -= 1e9
 
             preds = logits.argmax(dim=-1)[0].tolist()
 
         # Собираем исправленные слова
         changes = []
         result_words = []
+        space_id = self.vocab.token_to_id.get(" ", 6)
 
         for word_idx, (start, end) in enumerate(word_boundaries):
             orig_word = words[word_idx]
-            pred_ids = preds[start : end + 1]
-            pred_ids = [p for p in pred_ids if p != self.vocab.eow]
-
-            if len(pred_ids) != len(self.vocab.encode(orig_word)):
-                result_words.append(orig_word)
-                continue
-
-            pred_word = self.vocab.decode(pred_ids)
-
-            # Убираем множественные пробелы (артефакты удаления символов)
-            pred_word = " ".join(pred_word.split())
-
             orig_ids = self.vocab.encode(orig_word)
-            for i, (oi, pi) in enumerate(zip(orig_ids, pred_ids)):
-                if oi != pi:
-                    changes.append(
-                        (
-                            word_idx,
-                            i,
-                            self.vocab.id_to_token[oi],
-                            self.vocab.id_to_token[pi],
-                        )
-                    )
+            input_ids = ids[start : end + 1]  # включая <INS> и <EOW>
+            pred_ids_full = preds[start : end + 1]
+
+            # Обрабатываем предсказания с учётом <INS>
+            # <INS> на входе → если предсказан пробел, это "ничего" (пропускаем)
+            # <INS> на входе → если предсказан символ, это вставка
+            pred_word_chars = []
+            for inp_id, pred_id in zip(input_ids, pred_ids_full):
+                if inp_id == self.vocab.eow:
+                    # EOW позиция - пропускаем
+                    continue
+                elif inp_id == self.vocab.ins:
+                    # <INS> позиция - если предсказан пробел, пропускаем (ничего не вставляем)
+                    # если предсказан символ - вставляем его
+                    if pred_id != space_id and pred_id != self.vocab.ins:
+                        pred_word_chars.append(self.vocab.id_to_token[pred_id])
+                else:
+                    # Обычная позиция
+                    pred_word_chars.append(self.vocab.id_to_token[pred_id])
+
+            pred_word = "".join(pred_word_chars)
+
+            # Сравниваем изменения (только для обычных позиций)
+            pred_idx = 0
+            for i, oi in enumerate(orig_ids):
+                if pred_idx < len(pred_word_chars):
+                    pred_char = pred_word_chars[pred_idx]
+                    orig_char = self.vocab.id_to_token[oi]
+                    if orig_char != pred_char:
+                        changes.append((word_idx, i, orig_char, pred_char))
+                pred_idx += 1
 
             result_words.append(pred_word)
 
@@ -364,9 +394,7 @@ def create_app():
     status = load_model()
     print(status)
 
-    with gr.Blocks(
-        title="OCR Denoiser", css=".output-html { font-size: 16px; line-height: 1.8; }"
-    ) as app:
+    with gr.Blocks(title="OCR Denoiser") as app:
         gr.Markdown("# 🔧 OCR Denoising Model Tester")
 
         # Статус модели
@@ -451,4 +479,4 @@ def create_app():
 
 if __name__ == "__main__":
     app = create_app()
-    app.launch(share=False)
+    app.launch(share=False, css=".output-html { font-size: 16px; line-height: 1.8; }")

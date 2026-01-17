@@ -3,6 +3,7 @@
 <EOS>
 <EOW>
 <SEP>
+<INS>
  
 a
 b

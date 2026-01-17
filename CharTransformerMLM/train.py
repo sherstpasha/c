@@ -80,23 +80,30 @@ def inspect_denoise_predictions(model, vocab, dataset, device, n_samples=3):
     print("\n=== DENOISING PREDICTIONS CHECK ===")
 
     def pretty_full(ids):
-        s = vocab.decode(ids)
-        return s.replace("<EOW>", " | ")
+        s = vocab.decode(ids, collapse_ins=False)
+        return s.replace("<EOW>", " | ").replace("<INS>", "·")
 
-    for _ in range(n_samples):
-        x, y = dataset[random.randrange(len(dataset))]
+    def show_sample(x, y, label="SAMPLE"):
         x = x.unsqueeze(0).to(device)
         y = y.unsqueeze(0).to(device)
 
         logits, _ = model(x, y)
 
         eow = vocab.eow
-        mask = (x != eow) & (y == -100)
+        ins = vocab.ins
+
+        # Маска для копирования: не EOW и не INS (если target=-100)
+        mask = (x != eow) & (x != ins) & (y == -100)
         logits[..., eow] -= mask * 1e9
+
+        # EOW позиции - запрещаем не-EOW
         eow_positions = x == eow
         non_eow_mask = torch.ones_like(logits, dtype=torch.bool)
         non_eow_mask[..., eow] = False
         logits[eow_positions.unsqueeze(-1).expand_as(logits) & non_eow_mask] -= 1e9
+
+        # <INS> никогда не должен быть выходным символом (только входной слот)
+        logits[..., ins] -= 1e9
 
         preds = logits.argmax(dim=-1)
 
@@ -113,7 +120,7 @@ def inspect_denoise_predictions(model, vocab, dataset, device, n_samples=3):
                 tgt_full.append(vocab.id_to_token[yi])
             else:
                 tgt_full.append(vocab.id_to_token[xi])
-        tgt_full = "".join(tgt_full).replace("<EOW>", " | ")
+        tgt_full = "".join(tgt_full).replace("<EOW>", " | ").replace("<INS>", "·")
 
         fix_noisy = []
         fix_tgt = []
@@ -125,16 +132,27 @@ def inspect_denoise_predictions(model, vocab, dataset, device, n_samples=3):
                 fix_tgt.append(vocab.id_to_token[yi])
                 fix_pred.append(vocab.id_to_token[pi])
 
-        print("\n--- SAMPLE ---")
+        print(f"\n--- {label} ---")
         print("NOISY FULL:  ", noisy_full)
         print("TARGET FULL: ", tgt_full)
         print("PRED FULL:   ", pred_full)
 
         if fix_noisy:
             print("\nFIX ONLY:")
-            print("NOISY:  ", "".join(fix_noisy))
+            print("NOISY:  ", "".join(fix_noisy).replace("<INS>", "·"))
             print("TARGET: ", "".join(fix_tgt))
             print("PRED:   ", "".join(fix_pred))
+
+    # Сначала показываем пример из реальных OCR-пар (если есть)
+    real_sample = dataset.get_real_sample()
+    if real_sample is not None:
+        x, y = real_sample
+        show_sample(x, y, label="REAL OCR PAIR")
+
+    # Затем показываем синтетические примеры
+    for i in range(n_samples):
+        x, y = dataset.get_synthetic_sample()
+        show_sample(x, y, label=f"SYNTHETIC {i+1}")
 
 
 @torch.no_grad()
@@ -319,12 +337,22 @@ def save_all_augmentation_types(dataset, vocab, save_dir: Path):
     """Сохранить примеры ВСЕХ типов аугментаций принудительно"""
 
     def pretty_full(ids):
-        s = vocab.decode(ids)
-        return s.replace("<EOW>", " | ")
+        s = vocab.decode(ids, collapse_ins=False)
+        return s.replace("<EOW>", " | ").replace("<INS>", "·")
+
+    def encode_with_ins(words, vocab):
+        """Кодировать слова с добавлением <INS> перед <EOW>"""
+        ids = []
+        for w in words:
+            ids.extend(vocab.encode(w))
+            ids.append(vocab.ins)  # <INS> перед <EOW>
+            ids.append(vocab.eow)
+        return ids
 
     output_lines = []
     output_lines.append("=" * 80)
     output_lines.append("ВСЕ ТИПЫ АУГМЕНТАЦИЙ (ПРИНУДИТЕЛЬНО)")
+    output_lines.append("· = <INS> (позиция для вставки символа)")
     output_lines.append("=" * 80)
     output_lines.append("")
 
@@ -333,10 +361,7 @@ def save_all_augmentation_types(dataset, vocab, save_dir: Path):
     for _ in range(3):
         line = dataset.lines[random.randrange(len(dataset.lines))]
         words = line.split()[: dataset.max_words]
-        ids = []
-        for w in words:
-            ids.extend(vocab.encode(w))
-            ids.append(vocab.eow)
+        ids = encode_with_ins(words, vocab)
 
         x, y = dataset.force_synthetic_noise(ids)
 
@@ -366,13 +391,8 @@ def save_all_augmentation_types(dataset, vocab, save_dir: Path):
             words_noisy, word_idx, orig_word, noisy_word = result
             found += 1
 
-            ids_clean = []
-            ids_noisy = []
-            for i, (wc, wn) in enumerate(zip(words[: dataset.max_words], words_noisy)):
-                ids_clean.extend(vocab.encode(wc))
-                ids_clean.append(vocab.eow)
-                ids_noisy.extend(vocab.encode(wn))
-                ids_noisy.append(vocab.eow)
+            ids_clean = encode_with_ins(words[: dataset.max_words], vocab)
+            ids_noisy = encode_with_ins(words_noisy, vocab)
 
             output_lines.append(f"NOISY FULL:  {pretty_full(ids_noisy)}")
             output_lines.append(f"TARGET FULL: {pretty_full(ids_clean)}")
@@ -384,10 +404,7 @@ def save_all_augmentation_types(dataset, vocab, save_dir: Path):
     for _ in range(3):
         line = dataset.lines[random.randrange(len(dataset.lines))]
         words = line.split()[: dataset.max_words]
-        ids = []
-        for w in words:
-            ids.extend(vocab.encode(w))
-            ids.append(vocab.eow)
+        ids = encode_with_ins(words, vocab)
 
         x, y = dataset.force_extra_punct(ids)
 
@@ -406,10 +423,7 @@ def save_all_augmentation_types(dataset, vocab, save_dir: Path):
     for _ in range(3):
         line = dataset.lines[random.randrange(len(dataset.lines))]
         words = line.split()[: dataset.max_words]
-        ids = []
-        for w in words:
-            ids.extend(vocab.encode(w))
-            ids.append(vocab.eow)
+        ids = encode_with_ins(words, vocab)
 
         x, y = dataset.force_hyphen_comma(ids)
 
@@ -420,7 +434,7 @@ def save_all_augmentation_types(dataset, vocab, save_dir: Path):
         if fix_indices:
             noisy_chars = "".join([vocab.id_to_token[x[i]] for i in fix_indices])
             target_chars = "".join([vocab.id_to_token[ids[i]] for i in fix_indices])
-            output_lines.append(f"FIX: {noisy_chars} → пробелы")
+            output_lines.append(f"FIX: -, → {target_chars}")
         output_lines.append("")
 
     # 5. Запятая в начале слова
@@ -428,10 +442,7 @@ def save_all_augmentation_types(dataset, vocab, save_dir: Path):
     for _ in range(3):
         line = dataset.lines[random.randrange(len(dataset.lines))]
         words = line.split()[: dataset.max_words]
-        ids = []
-        for w in words:
-            ids.extend(vocab.encode(w))
-            ids.append(vocab.eow)
+        ids = encode_with_ins(words, vocab)
 
         x, y = dataset.force_comma_prefix(ids)
 
@@ -440,52 +451,44 @@ def save_all_augmentation_types(dataset, vocab, save_dir: Path):
 
         fix_indices = [i for i, yi in enumerate(y) if yi != -100]
         if fix_indices:
-            output_lines.append(f"FIX: , → пробел")
+            target_char = vocab.id_to_token[y[fix_indices[0]]]
+            output_lines.append(f"FIX: , → {target_char}")
         output_lines.append("")
 
-    # 6. Повторы окончаний
-    output_lines.append("--- ТИП 6: ПОВТОРЫ ОКОНЧАНИЙ ---")
-    for _ in range(3):
+    # 6. Повторы окончаний (отключено с <INS>)
+    output_lines.append("--- ТИП 6: ПОВТОРЫ ОКОНЧАНИЙ (ОТКЛЮЧЕНО) ---")
+    output_lines.append("Сложно реализовать с <INS>, пока отключено")
+    output_lines.append("")
+
+    # 7. Одиночный дефис-разрыв с использованием <INS>
+    output_lines.append("--- ТИП 7: ОДИНОЧНЫЙ ДЕФИС-РАЗРЫВ (с <INS>) ---")
+    attempts = 0
+    found = 0
+    while found < 3 and attempts < 50:
+        attempts += 1
         line = dataset.lines[random.randrange(len(dataset.lines))]
         words = line.split()[: dataset.max_words]
         if len(words) < 2:
             continue
-        ids = []
-        for w in words:
-            ids.extend(vocab.encode(w))
-            ids.append(vocab.eow)
-
-        x, y = dataset.force_repeat_ending(ids)
-
-        output_lines.append(f"NOISY FULL:  {pretty_full(x)}")
-        output_lines.append(f"TARGET FULL: {pretty_full(ids)}")
-
-        fix_indices = [i for i, yi in enumerate(y) if yi != -100]
-        if fix_indices:
-            noisy_chars = "".join([vocab.id_to_token[x[i]] for i in fix_indices])
-            output_lines.append(f"FIX: повтор '{noisy_chars}' → пробелы")
-        output_lines.append("")
-
-    # 7. Одиночный дефис-разрыв
-    output_lines.append("--- ТИП 7: ОДИНОЧНЫЙ ДЕФИС-РАЗРЫВ ---")
-    for _ in range(3):
-        line = dataset.lines[random.randrange(len(dataset.lines))]
-        words = line.split()[: dataset.max_words]
-        if len(words) < 2:
-            continue
-        ids = []
-        for w in words:
-            ids.extend(vocab.encode(w))
-            ids.append(vocab.eow)
+        ids = encode_with_ins(words, vocab)
 
         x, y = dataset.force_single_hyphen(ids)
 
+        fix_indices = [i for i, yi in enumerate(y) if yi != -100]
+        if not fix_indices:
+            continue
+
+        found += 1
         output_lines.append(f"NOISY FULL:  {pretty_full(x)}")
         output_lines.append(f"TARGET FULL: {pretty_full(ids)}")
 
-        fix_indices = [i for i, yi in enumerate(y) if yi != -100]
-        if fix_indices:
-            output_lines.append(f"FIX: - → пробел")
+        # Показываем что происходит
+        ins_filled = [i for i in fix_indices if x[i] == vocab.ins]
+        if ins_filled:
+            filled_char = vocab.id_to_token[y[ins_filled[0]]]
+            output_lines.append(f"FIX: - → восстановлен, · → {filled_char} (вставка)")
+        else:
+            output_lines.append(f"FIX: - → восстановлен")
         output_lines.append("")
 
     aug_file = save_dir / "all_augmentation_types.txt"
@@ -544,6 +547,8 @@ def train(config):
         dropout=config["dropout"],
         pad_idx=vocab.pad,
         eow_idx=vocab.eow,
+        ins_idx=vocab.ins,
+        space_idx=vocab.token_to_id.get(" ", 6),
     ).to(device)
 
     optimizer = torch.optim.AdamW(
@@ -589,25 +594,34 @@ def train(config):
 
             logits, _ = model(x, y)
 
-            eow = vocab.eow
-
-            # At non-EOW positions where y == -100 (copy positions), penalize EOW token
-            copy_mask = (x != eow) & (y == -100)  # [B, T]
-            logits[:, :, eow] = logits[:, :, eow] - copy_mask.float() * 1e9
-
-            # At EOW positions, penalize all non-EOW tokens
-            eow_positions = x == eow  # [B, T]
-            # Create penalty: [B, T, vocab_size] where EOW positions have -1e9 for all except EOW token
-            penalty = torch.zeros_like(logits)
-            penalty[:, :, :eow] = eow_positions.unsqueeze(-1).float() * 1e9
-            penalty[:, :, eow + 1 :] = eow_positions.unsqueeze(-1).float() * 1e9
-            logits = logits - penalty
-
+            # Loss вычисляем на чистых logits (copy-bias уже применён в модели)
             loss = ce_loss(
                 logits.view(-1, logits.size(-1)),
                 y.view(-1),
             )
-            acc = mlm_accuracy(logits, y)
+
+            # Для accuracy применяем маски чтобы получить правильные предсказания
+            eow = vocab.eow
+            ins = vocab.ins
+
+            with torch.no_grad():
+                masked_logits = logits.clone()
+
+                # <INS> никогда не должен быть выходным символом
+                masked_logits[..., ins] -= 1e9
+
+                # At non-EOW/INS positions where y == -100, penalize EOW token
+                copy_mask = (x != eow) & (x != ins) & (y == -100)
+                masked_logits[:, :, eow] -= copy_mask.float() * 1e9
+
+                # At EOW positions, penalize all non-EOW tokens
+                eow_positions = x == eow
+                penalty = torch.zeros_like(masked_logits)
+                penalty[:, :, :eow] = eow_positions.unsqueeze(-1).float() * 1e9
+                penalty[:, :, eow + 1 :] = eow_positions.unsqueeze(-1).float() * 1e9
+                masked_logits = masked_logits - penalty
+
+                acc = mlm_accuracy(masked_logits, y)
 
             optimizer.zero_grad()
             loss.backward()

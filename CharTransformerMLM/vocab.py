@@ -18,13 +18,16 @@ class CharVocab:
         self.eos = self.token_to_id.get("<EOS>")
         self.eow = self.token_to_id.get("<EOW>")
         self.sep = self.token_to_id.get("<SEP>")
+        self.ins = self.token_to_id.get("<INS>")
 
         if self.eow is None:
             raise ValueError("В charset.txt должен быть <EOW>")
+        if self.ins is None:
+            raise ValueError("В charset.txt должен быть <INS>")
 
         self.special_ids = {
             i
-            for i in [self.pad, self.sos, self.eos, self.eow, self.sep]
+            for i in [self.pad, self.sos, self.eos, self.eow, self.sep, self.ins]
             if i is not None
         }
 
@@ -42,5 +45,10 @@ class CharVocab:
     def encode(self, text: str) -> List[int]:
         return [self.token_to_id[ch] for ch in text if ch in self.token_to_id]
 
-    def decode(self, ids: List[int]) -> str:
-        return "".join(self.id_to_token[i] for i in ids)
+    def decode(self, ids: List[int], collapse_ins: bool = True) -> str:
+        result = []
+        for i in ids:
+            if collapse_ins and i == self.ins:
+                continue  # <INS> схлопывается в пустоту
+            result.append(self.id_to_token[i])
+        return "".join(result)
