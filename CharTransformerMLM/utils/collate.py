@@ -2,18 +2,6 @@ import torch
 
 
 def collate_denoise(batch, pad_idx: int):
-    """
-    Collate для char-level denoising / MLM.
-
-    batch: List[(x, y)]
-      x: [T]
-      y: [T]
-
-    return dict:
-      x: [B, T]
-      y: [B, T]
-      attn_mask: [B, T]  (True = padding)
-    """
     xs, ys = zip(*batch)
 
     max_len = max(x.size(0) for x in xs)

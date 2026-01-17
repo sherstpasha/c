@@ -28,14 +28,15 @@ class CharVocab:
             if i is not None
         }
 
-        # Для MLM шума: все символы кроме специальных, но включая пробел и дефис
         self.mlm_replace_ids = [
             i for i in self.token_to_id.values() if i not in self.special_ids
         ]
-        
-        # Убедимся что пробел и дефис есть в replace_ids
+
         for ch in [" ", "-"]:
-            if ch in self.token_to_id and self.token_to_id[ch] not in self.mlm_replace_ids:
+            if (
+                ch in self.token_to_id
+                and self.token_to_id[ch] not in self.mlm_replace_ids
+            ):
                 self.mlm_replace_ids.append(self.token_to_id[ch])
 
     def encode(self, text: str) -> List[int]:

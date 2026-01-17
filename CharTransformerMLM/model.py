@@ -36,11 +36,10 @@ class CharTransformerMLM(nn.Module):
             dropout=dropout,
             activation="gelu",
             batch_first=True,
-            norm_first=True,  # Pre-LN
+            norm_first=True,
         )
         self.encoder = nn.TransformerEncoder(enc_layer, num_layers=n_layers)
 
-        # --- correction head (Δ) ---
         self.char_head = nn.Linear(emb_size, vocab_size)
 
         self._reset_parameters()
@@ -48,7 +47,7 @@ class CharTransformerMLM(nn.Module):
     def _reset_parameters(self):
         nn.init.normal_(self.char_emb.weight, std=0.02)
         nn.init.normal_(self.pos_emb.weight, std=0.02)
-        # Обнулить эмбеддинг для pad
+
         with torch.no_grad():
             self.char_emb.weight[self.pad_idx].zero_()
 

@@ -15,11 +15,6 @@ from CharTransformerMLM.vocab import CharVocab
 from CharTransformerMLM.utils.collate import collate_denoise
 
 
-# ============================================================
-# LOGGER
-# ============================================================
-
-
 class TxtLogger:
     def __init__(self, log_path: str):
         self.log_path = log_path
@@ -32,10 +27,6 @@ class TxtLogger:
         with open(self.log_path, "a", encoding="utf-8") as f:
             f.write(line + "\n")
 
-
-# ============================================================
-# CONFIG
-# ============================================================
 
 CONFIG = {
     "seed": 42,
@@ -69,11 +60,6 @@ CONFIG = {
 }
 
 
-# ============================================================
-# UTILS
-# ============================================================
-
-
 def set_seed(seed):
     random.seed(seed)
     torch.manual_seed(seed)
@@ -104,12 +90,9 @@ def inspect_denoise_predictions(model, vocab, dataset, device, n_samples=3):
 
         logits, _ = model(x, y)
 
-        # Применяем ту же маску, что и при обучении
         eow = vocab.eow
-        # Запретить предсказывать EOW там, где его нет
         mask = (x != eow) & (y == -100)
         logits[..., eow] -= mask * 1e9
-        # Запретить предсказывать НЕ-EOW там, где в input стоит EOW
         eow_positions = x == eow
         non_eow_mask = torch.ones_like(logits, dtype=torch.bool)
         non_eow_mask[..., eow] = False
@@ -156,22 +139,17 @@ def inspect_denoise_predictions(model, vocab, dataset, device, n_samples=3):
 
 @torch.no_grad()
 def inspect_word_embeddings(model, vocab, dataset, device, n_words=3, top_k=5):
-    """Показать слова и их ближайших соседей по эмбеддингам (на чистых словах)"""
     model.eval()
     print("\n=== WORD EMBEDDINGS CHECK ===")
 
-    # Собираем чистые слова из текстового файла
     words = []
     embeddings = []
 
-    # Берём случайные строки из dataset.lines (чистые тексты)
     sample_lines = random.sample(dataset.lines, min(100, len(dataset.lines)))
 
     for line in sample_lines:
-        # Разбиваем на слова
         line_words = line.split()
         for word in line_words:
-            # Фильтруем: только буквенные слова 3-15 символов
             if len(word) < 3 or len(word) > 15:
                 continue
             if not all(ch in vocab.token_to_id for ch in word):
@@ -179,7 +157,6 @@ def inspect_word_embeddings(model, vocab, dataset, device, n_words=3, top_k=5):
             if not any(ch.isalpha() for ch in word):
                 continue
 
-            # Кодируем слово + EOW
             ids = vocab.encode(word) + [vocab.eow]
             x = torch.tensor([ids], device=device)
 
@@ -197,21 +174,17 @@ def inspect_word_embeddings(model, vocab, dataset, device, n_words=3, top_k=5):
         print("Недостаточно слов для анализа")
         return
 
-    # Стекаем эмбеддинги
-    emb_matrix = torch.stack(embeddings)  # [N, D]
-    emb_matrix = emb_matrix / emb_matrix.norm(dim=-1, keepdim=True)  # Нормализация
+    emb_matrix = torch.stack(embeddings)
+    emb_matrix = emb_matrix / emb_matrix.norm(dim=-1, keepdim=True)
 
-    # Выбираем n_words случайных слов
     indices = random.sample(range(len(words)), n_words)
 
     for idx in indices:
         query_word = words[idx]
         query_emb = emb_matrix[idx : idx + 1]  # [1, D]
 
-        # Косинусное сходство
         similarities = (emb_matrix @ query_emb.T).squeeze()  # [N]
 
-        # Топ-k+1 (включая само слово)
         top_indices = similarities.argsort(descending=True)[: top_k + 1]
 
         neighbors = []
@@ -222,9 +195,304 @@ def inspect_word_embeddings(model, vocab, dataset, device, n_words=3, top_k=5):
         print(f"\n'{query_word}' → {', '.join(neighbors[:top_k])}")
 
 
-# ============================================================
-# TRAIN
-# ============================================================
+def save_augmentation_samples(dataset, vocab, save_dir: Path, n_samples: int = 10):
+
+    def pretty_full(ids):
+        s = vocab.decode(ids)
+        return s.replace("<EOW>", " | ")
+
+    def detect_augmentation_types(x_ids, y_ids, vocab):
+        """Определить типы примененных аугментаций"""
+        types = []
+        space_id = vocab.token_to_id.get(" ")
+        comma_id = vocab.token_to_id.get(",")
+        hyphen_id = vocab.token_to_id.get("-")
+
+        for i, (xi, yi) in enumerate(zip(x_ids, y_ids)):
+            if yi != -100:
+                # 1. Дефис-запятая (-, в конце слова)
+                if (
+                    i > 0
+                    and xi == comma_id
+                    and x_ids[i - 1] == hyphen_id
+                    and yi == space_id
+                ):
+                    if "Артефакты переносов: -," not in types:
+                        types.append("Артефакты переносов: -,")
+
+                # 2. Запятая в начале слова
+                if (
+                    xi == comma_id
+                    and yi == space_id
+                    and i > 0
+                    and x_ids[i - 1] == vocab.eow
+                ):
+                    if "Артефакты переносов: , в начале" not in types:
+                        types.append("Артефакты переносов: , в начале")
+
+                # 3. Одиночный дефис в конце слова
+                if (
+                    xi == hyphen_id
+                    and yi == space_id
+                    and i + 1 < len(x_ids)
+                    and x_ids[i + 1] == vocab.eow
+                ):
+                    if "Разрыв слова: одиночный -" not in types:
+                        types.append("Разрыв слова: одиночный -")
+
+                # 4. Лишняя пунктуация (замена на знак препинания)
+                if xi in [
+                    comma_id,
+                    vocab.token_to_id.get("."),
+                    vocab.token_to_id.get(";"),
+                ]:
+                    if yi != space_id and "Лишняя пунктуация" not in types:
+                        types.append("Лишняя пунктуация")
+
+                # 5. Синтетический шум (обычные замены символов)
+                if (
+                    yi != space_id
+                    and xi != comma_id
+                    and xi != hyphen_id
+                    and xi != vocab.eow
+                    and "Синтетический шум" not in types
+                ):
+                    types.append("Синтетический шум")
+
+        if not types:
+            types.append("Без изменений")
+
+        return types
+
+    output_lines = []
+    output_lines.append("=" * 80)
+    output_lines.append("AUGMENTATION SAMPLES")
+    output_lines.append("=" * 80)
+    output_lines.append("")
+
+    for sample_idx in range(n_samples):
+        x, y = dataset[sample_idx]
+
+        x_ids = x.tolist()
+        y_ids = y.tolist()
+
+        # Определяем типы аугментаций
+        aug_types = detect_augmentation_types(x_ids, y_ids, vocab)
+
+        noisy_full = pretty_full(x_ids)
+
+        tgt_full = []
+        for xi, yi in zip(x_ids, y_ids):
+            if yi != -100:
+                tgt_full.append(vocab.id_to_token[yi])
+            else:
+                tgt_full.append(vocab.id_to_token[xi])
+        tgt_full = "".join(tgt_full).replace("<EOW>", " | ")
+
+        fix_noisy = []
+        fix_tgt = []
+
+        for xi, yi in zip(x_ids, y_ids):
+            if yi != -100:
+                fix_noisy.append(vocab.id_to_token[xi])
+                fix_tgt.append(vocab.id_to_token[yi])
+
+        if fix_noisy:
+            output_lines.append(f"--- SAMPLE {sample_idx + 1} ---")
+            output_lines.append(f"АУГМЕНТАЦИИ: {', '.join(aug_types)}")
+            output_lines.append(f"NOISY FULL:  {noisy_full}")
+            output_lines.append(f"TARGET FULL: {tgt_full}")
+            output_lines.append("")
+            output_lines.append("FIX ONLY:")
+            output_lines.append(f"NOISY:  {''.join(fix_noisy)}")
+            output_lines.append(f"TARGET: {''.join(fix_tgt)}")
+            output_lines.append("")
+
+    aug_file = save_dir / "augmentation_samples.txt"
+    with open(aug_file, "w", encoding="utf-8") as f:
+        f.write("\n".join(output_lines))
+
+    print(f"Сохранено {n_samples} примеров аугментаций в {aug_file}")
+
+
+def save_all_augmentation_types(dataset, vocab, save_dir: Path):
+    """Сохранить примеры ВСЕХ типов аугментаций принудительно"""
+
+    def pretty_full(ids):
+        s = vocab.decode(ids)
+        return s.replace("<EOW>", " | ")
+
+    output_lines = []
+    output_lines.append("=" * 80)
+    output_lines.append("ВСЕ ТИПЫ АУГМЕНТАЦИЙ (ПРИНУДИТЕЛЬНО)")
+    output_lines.append("=" * 80)
+    output_lines.append("")
+
+    # 1. Синтетический шум
+    output_lines.append("--- ТИП 1: СИНТЕТИЧЕСКИЙ ШУМ ---")
+    for _ in range(3):
+        line = dataset.lines[random.randrange(len(dataset.lines))]
+        words = line.split()[: dataset.max_words]
+        ids = []
+        for w in words:
+            ids.extend(vocab.encode(w))
+            ids.append(vocab.eow)
+
+        x, y = dataset.force_synthetic_noise(ids)
+
+        output_lines.append(f"NOISY FULL:  {pretty_full(x)}")
+        output_lines.append(f"TARGET FULL: {pretty_full(ids)}")
+
+        fix_indices = [i for i, yi in enumerate(y) if yi != -100]
+        if fix_indices:
+            noisy_chars = "".join([vocab.id_to_token[x[i]] for i in fix_indices])
+            target_chars = "".join([vocab.id_to_token[y[i]] for i in fix_indices])
+            output_lines.append(f"FIX: {noisy_chars} → {target_chars}")
+        output_lines.append("")
+
+    # 2. Замена окончаний
+    output_lines.append("--- ТИП 2: ЗАМЕНА ОКОНЧАНИЙ ---")
+    attempts = 0
+    found = 0
+    while found < 3 and attempts < 50:
+        attempts += 1
+        line = dataset.lines[random.randrange(len(dataset.lines))]
+        words = line.split()
+        if len(words) < 3:
+            continue
+
+        result = dataset.force_ending_swap(words[: dataset.max_words])
+        if result:
+            words_noisy, word_idx, orig_word, noisy_word = result
+            found += 1
+
+            ids_clean = []
+            ids_noisy = []
+            for i, (wc, wn) in enumerate(zip(words[: dataset.max_words], words_noisy)):
+                ids_clean.extend(vocab.encode(wc))
+                ids_clean.append(vocab.eow)
+                ids_noisy.extend(vocab.encode(wn))
+                ids_noisy.append(vocab.eow)
+
+            output_lines.append(f"NOISY FULL:  {pretty_full(ids_noisy)}")
+            output_lines.append(f"TARGET FULL: {pretty_full(ids_clean)}")
+            output_lines.append(f"ЗАМЕНА: {noisy_word} → {orig_word}")
+            output_lines.append("")
+
+    # 3. Лишняя пунктуация
+    output_lines.append("--- ТИП 3: ЛИШНЯЯ ПУНКТУАЦИЯ ---")
+    for _ in range(3):
+        line = dataset.lines[random.randrange(len(dataset.lines))]
+        words = line.split()[: dataset.max_words]
+        ids = []
+        for w in words:
+            ids.extend(vocab.encode(w))
+            ids.append(vocab.eow)
+
+        x, y = dataset.force_extra_punct(ids)
+
+        output_lines.append(f"NOISY FULL:  {pretty_full(x)}")
+        output_lines.append(f"TARGET FULL: {pretty_full(ids)}")
+
+        fix_indices = [i for i, yi in enumerate(y) if yi != -100]
+        if fix_indices:
+            noisy_chars = "".join([vocab.id_to_token[x[i]] for i in fix_indices])
+            target_chars = "".join([vocab.id_to_token[y[i]] for i in fix_indices])
+            output_lines.append(f"FIX: {noisy_chars} → {target_chars}")
+        output_lines.append("")
+
+    # 4. Дефис-запятая в конце слова
+    output_lines.append("--- ТИП 4: ДЕФИС-ЗАПЯТАЯ (-,) ---")
+    for _ in range(3):
+        line = dataset.lines[random.randrange(len(dataset.lines))]
+        words = line.split()[: dataset.max_words]
+        ids = []
+        for w in words:
+            ids.extend(vocab.encode(w))
+            ids.append(vocab.eow)
+
+        x, y = dataset.force_hyphen_comma(ids)
+
+        output_lines.append(f"NOISY FULL:  {pretty_full(x)}")
+        output_lines.append(f"TARGET FULL: {pretty_full(ids)}")
+
+        fix_indices = [i for i, yi in enumerate(y) if yi != -100]
+        if fix_indices:
+            noisy_chars = "".join([vocab.id_to_token[x[i]] for i in fix_indices])
+            target_chars = "".join([vocab.id_to_token[ids[i]] for i in fix_indices])
+            output_lines.append(f"FIX: {noisy_chars} → пробелы")
+        output_lines.append("")
+
+    # 5. Запятая в начале слова
+    output_lines.append("--- ТИП 5: ЗАПЯТАЯ В НАЧАЛЕ СЛОВА ---")
+    for _ in range(3):
+        line = dataset.lines[random.randrange(len(dataset.lines))]
+        words = line.split()[: dataset.max_words]
+        ids = []
+        for w in words:
+            ids.extend(vocab.encode(w))
+            ids.append(vocab.eow)
+
+        x, y = dataset.force_comma_prefix(ids)
+
+        output_lines.append(f"NOISY FULL:  {pretty_full(x)}")
+        output_lines.append(f"TARGET FULL: {pretty_full(ids)}")
+
+        fix_indices = [i for i, yi in enumerate(y) if yi != -100]
+        if fix_indices:
+            output_lines.append(f"FIX: , → пробел")
+        output_lines.append("")
+
+    # 6. Повторы окончаний
+    output_lines.append("--- ТИП 6: ПОВТОРЫ ОКОНЧАНИЙ ---")
+    for _ in range(3):
+        line = dataset.lines[random.randrange(len(dataset.lines))]
+        words = line.split()[: dataset.max_words]
+        if len(words) < 2:
+            continue
+        ids = []
+        for w in words:
+            ids.extend(vocab.encode(w))
+            ids.append(vocab.eow)
+
+        x, y = dataset.force_repeat_ending(ids)
+
+        output_lines.append(f"NOISY FULL:  {pretty_full(x)}")
+        output_lines.append(f"TARGET FULL: {pretty_full(ids)}")
+
+        fix_indices = [i for i, yi in enumerate(y) if yi != -100]
+        if fix_indices:
+            noisy_chars = "".join([vocab.id_to_token[x[i]] for i in fix_indices])
+            output_lines.append(f"FIX: повтор '{noisy_chars}' → пробелы")
+        output_lines.append("")
+
+    # 7. Одиночный дефис-разрыв
+    output_lines.append("--- ТИП 7: ОДИНОЧНЫЙ ДЕФИС-РАЗРЫВ ---")
+    for _ in range(3):
+        line = dataset.lines[random.randrange(len(dataset.lines))]
+        words = line.split()[: dataset.max_words]
+        if len(words) < 2:
+            continue
+        ids = []
+        for w in words:
+            ids.extend(vocab.encode(w))
+            ids.append(vocab.eow)
+
+        x, y = dataset.force_single_hyphen(ids)
+
+        output_lines.append(f"NOISY FULL:  {pretty_full(x)}")
+        output_lines.append(f"TARGET FULL: {pretty_full(ids)}")
+
+        fix_indices = [i for i, yi in enumerate(y) if yi != -100]
+        if fix_indices:
+            output_lines.append(f"FIX: - → пробел")
+        output_lines.append("")
+
+    aug_file = save_dir / "all_augmentation_types.txt"
+    with open(aug_file, "w", encoding="utf-8") as f:
+        f.write("\n".join(output_lines))
+
+    print(f"\nСохранены примеры ВСЕХ 7 типов аугментаций в {aug_file}")
 
 
 def train(config):
@@ -242,16 +510,23 @@ def train(config):
         vocab=vocab,
         words_path=config.get("words_path"),
         max_words=config["max_words"],
+        noise_prob=config.get("noise_prob", 0.15),
         p_ending_swap=config.get("p_ending_swap", 0.03),
         p_extra_punct=config.get("p_extra_punct", 0.02),
+        p_hyphen_comma=config.get("p_hyphen_comma", 0.015),
+        p_comma_prefix=config.get("p_comma_prefix", 0.01),
+        p_repeat_ending=config.get("p_repeat_ending", 0.01),
+        p_single_hyphen=config.get("p_single_hyphen", 0.02),
     )
 
-    # Сохранить топ окончаний в JSON для проверки
     if dataset.top_endings:
         endings_path = Path(config["save_dir"]) / "top_endings.json"
         with open(endings_path, "w", encoding="utf-8") as f:
             json.dump(dataset.top_endings, f, ensure_ascii=False, indent=2)
         logger.log(f"Сохранено {len(dataset.top_endings)} окончаний в {endings_path}")
+
+    # Сохранить примеры ВСЕХ типов аугментаций принудительно
+    save_all_augmentation_types(dataset, vocab, Path(config["save_dir"]))
 
     loader = DataLoader(
         dataset,
@@ -296,7 +571,6 @@ def train(config):
         start_epoch = ckpt["epoch"] + 1
 
     for epoch in range(start_epoch, config["epochs"]):
-        # Линейно увеличиваем p_real от start до end
         progress = epoch / max(1, config["epochs"] - 1)
         dataset.p_real = config["p_real_start"] + progress * (
             config["p_real_end"] - config["p_real_start"]
@@ -316,17 +590,18 @@ def train(config):
             logits, _ = model(x, y)
 
             eow = vocab.eow
-            # Запретить предсказывать EOW там, где его нет
-            mask = (x != eow) & (y == -100)
-            logits[..., eow] -= mask * 1e9
 
-            # Запретить предсказывать НЕ-EOW там, где в input стоит EOW
-            eow_positions = x == eow
-            # Создаём маску для всех токенов кроме EOW
-            non_eow_mask = torch.ones_like(logits, dtype=torch.bool)
-            non_eow_mask[..., eow] = False
-            # Применяем штраф к позициям где должен быть EOW
-            logits[eow_positions.unsqueeze(-1).expand_as(logits) & non_eow_mask] -= 1e9
+            # At non-EOW positions where y == -100 (copy positions), penalize EOW token
+            copy_mask = (x != eow) & (y == -100)  # [B, T]
+            logits[:, :, eow] = logits[:, :, eow] - copy_mask.float() * 1e9
+
+            # At EOW positions, penalize all non-EOW tokens
+            eow_positions = x == eow  # [B, T]
+            # Create penalty: [B, T, vocab_size] where EOW positions have -1e9 for all except EOW token
+            penalty = torch.zeros_like(logits)
+            penalty[:, :, :eow] = eow_positions.unsqueeze(-1).float() * 1e9
+            penalty[:, :, eow + 1 :] = eow_positions.unsqueeze(-1).float() * 1e9
+            logits = logits - penalty
 
             loss = ce_loss(
                 logits.view(-1, logits.size(-1)),
@@ -361,10 +636,10 @@ def train(config):
             inspect_denoise_predictions(model, vocab, dataset, device)
             inspect_word_embeddings(model, vocab, dataset, device)
 
+        save_dir = Path(config["save_dir"])
+
         if ep_acc > best_acc:
             best_acc = ep_acc
-
-            save_dir = Path(config["save_dir"])
 
             torch.save(
                 {
@@ -382,7 +657,6 @@ def train(config):
                 save_dir / "best_weights.pt",
             )
 
-            # Сохранить конфиг как JSON
             with open(save_dir / "config.json", "w", encoding="utf-8") as f:
                 json.dump(config, f, ensure_ascii=False, indent=2)
 
