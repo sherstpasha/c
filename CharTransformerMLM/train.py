@@ -103,6 +103,18 @@ def inspect_denoise_predictions(model, vocab, dataset, device, n_samples=3):
         y = y.unsqueeze(0).to(device)
 
         logits, _ = model(x, y)
+
+        # Применяем ту же маску, что и при обучении
+        eow = vocab.eow
+        # Запретить предсказывать EOW там, где его нет
+        mask = (x != eow) & (y == -100)
+        logits[..., eow] -= mask * 1e9
+        # Запретить предсказывать НЕ-EOW там, где в input стоит EOW
+        eow_positions = x == eow
+        non_eow_mask = torch.ones_like(logits, dtype=torch.bool)
+        non_eow_mask[..., eow] = False
+        logits[eow_positions.unsqueeze(-1).expand_as(logits) & non_eow_mask] -= 1e9
+
         preds = logits.argmax(dim=-1)
 
         x_ids = x[0].tolist()
@@ -304,8 +316,17 @@ def train(config):
             logits, _ = model(x, y)
 
             eow = vocab.eow
+            # Запретить предсказывать EOW там, где его нет
             mask = (x != eow) & (y == -100)
             logits[..., eow] -= mask * 1e9
+
+            # Запретить предсказывать НЕ-EOW там, где в input стоит EOW
+            eow_positions = x == eow
+            # Создаём маску для всех токенов кроме EOW
+            non_eow_mask = torch.ones_like(logits, dtype=torch.bool)
+            non_eow_mask[..., eow] = False
+            # Применяем штраф к позициям где должен быть EOW
+            logits[eow_positions.unsqueeze(-1).expand_as(logits) & non_eow_mask] -= 1e9
 
             loss = ce_loss(
                 logits.view(-1, logits.size(-1)),
