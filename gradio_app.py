@@ -1,39 +1,44 @@
 """
-Gradio интерфейс для тестирования OCR-денойзинг модели
+Gradio app for the OCR edit model (CharTransformerEdit).
 """
 
-import re
-import torch
-import gradio as gr
+import difflib
+import html
 from pathlib import Path
+from typing import List, Optional, Tuple
 
-from CharTransformerMLM.model import CharTransformerMLM
+import gradio as gr
+import torch
+
+from CharTransformerMLM.model import CharTransformerEdit, EditVocab
 from CharTransformerMLM.vocab import CharVocab
 
 
-# Пути по умолчанию
-DEFAULT_CHECKPOINT = "checkpoints1/best.pt"
+DEFAULT_CHECKPOINT = "checkpoints_edit/best_em.pt"
 DEFAULT_CHARSET = "data/charset.txt"
 DEFAULT_WORDS = "data/all_words.txt"
 
 
-def preprocess_hyphen_breaks(text: str) -> tuple[str, list[tuple[str, str]]]:
-    """
-    Препроцессинг для артефактов переносов строк:
-    - "слово-," → "слово"  (убираем -,)
-    - ",слово" → "слово"   (убираем , в начале)
-    - "слово-" → "слово"   (убираем - в конце если следующее слово с маленькой)
+def load_training_config() -> dict:
+    try:
+        from train import CONFIG as TRAIN_CONFIG
 
-    Возвращает: (обработанный текст, список замен для статистики)
+        return TRAIN_CONFIG
+    except Exception:
+        return {}
+
+
+def preprocess_hyphen_breaks(text: str) -> Tuple[str, List[Tuple[str, str]]]:
     """
-    changes = []
+    Normalize some common OCR hyphen/comma split artifacts.
+    """
+    changes: List[Tuple[str, str]] = []
     words = text.split()
-    result_words = []
+    result_words: List[str] = []
 
     for i, word in enumerate(words):
         new_word = word
 
-        # Убираем -,  в конце
         if new_word.endswith("-,"):
             new_word = new_word[:-2]
             changes.append((word, new_word))
@@ -41,15 +46,12 @@ def preprocess_hyphen_breaks(text: str) -> tuple[str, list[tuple[str, str]]]:
             new_word = new_word[:-2]
             changes.append((word, new_word))
 
-        # Убираем , в начале (если это артефакт переноса)
         if new_word.startswith(",") and len(new_word) > 1 and new_word[1].isalpha():
             new_word = new_word[1:]
             changes.append((word, new_word))
 
-        # Убираем одиночный - в конце если следующее слово начинается с маленькой буквы
         if new_word.endswith("-") and i + 1 < len(words):
             next_word = words[i + 1]
-            # Убираем , из начала следующего для проверки
             next_clean = next_word.lstrip(",")
             if next_clean and next_clean[0].islower():
                 new_word = new_word[:-1]
@@ -60,14 +62,109 @@ def preprocess_hyphen_breaks(text: str) -> tuple[str, list[tuple[str, str]]]:
     return " ".join(result_words), changes
 
 
+def apply_edit_ops(vocab: CharVocab, edit_vocab: EditVocab, x_ids, op_ids) -> str:
+    """
+    Apply edit operations to noisy input to reconstruct target string.
+    """
+    out: List[str] = []
+
+    for xi, oi in zip(x_ids, op_ids):
+        ch = vocab.id_to_token.get(xi, "")
+
+        if oi == -100 or edit_vocab.id_to_op[oi] == "COPY":
+            out.append(ch)
+        elif edit_vocab.id_to_op[oi] == "DELETE":
+            continue
+        elif edit_vocab.id_to_op[oi].startswith("REPLACE_"):
+            out.append(edit_vocab.id_to_op[oi].replace("REPLACE_", ""))
+        elif edit_vocab.id_to_op[oi].startswith("INSERT_"):
+            ins = edit_vocab.id_to_op[oi].replace("INSERT_", "")
+            out.append(ins)
+            out.append(ch)
+
+    return "".join(out)
+
+
+def _wrap_deleted(text: str) -> str:
+    return (
+        '<span style="background-color: #FFB6C1; '
+        'font-weight: bold; text-decoration: line-through;">'
+        f"{html.escape(text)}"
+        "</span>"
+    )
+
+
+def _wrap_inserted(text: str) -> str:
+    return (
+        '<span style="background-color: #90EE90; font-weight: bold;">'
+        f"{html.escape(text)}"
+        "</span>"
+    )
+
+
+def diff_word(orig: str, new: str) -> Tuple[str, str, int]:
+    matcher = difflib.SequenceMatcher(None, orig, new)
+    orig_parts: List[str] = []
+    new_parts: List[str] = []
+    change_chars = 0
+
+    for tag, i1, i2, j1, j2 in matcher.get_opcodes():
+        if tag == "equal":
+            orig_parts.append(html.escape(orig[i1:i2]))
+            new_parts.append(html.escape(new[j1:j2]))
+        elif tag == "replace":
+            change_chars += max(i2 - i1, j2 - j1)
+            orig_parts.append(_wrap_deleted(orig[i1:i2]))
+            new_parts.append(_wrap_inserted(new[j1:j2]))
+        elif tag == "delete":
+            change_chars += i2 - i1
+            orig_parts.append(_wrap_deleted(orig[i1:i2]))
+        elif tag == "insert":
+            change_chars += j2 - j1
+            new_parts.append(_wrap_inserted(new[j1:j2]))
+
+    return "".join(orig_parts), "".join(new_parts), change_chars
+
+
+def diff_words(
+    original_words: List[str], result_words: List[str]
+) -> Tuple[str, str, int, int]:
+    if len(original_words) != len(result_words):
+        orig_html = html.escape(" ".join(original_words))
+        res_html = html.escape(" ".join(result_words))
+        return orig_html, res_html, 0, 0
+
+    orig_parts: List[str] = []
+    res_parts: List[str] = []
+    changed_words = 0
+    changed_chars = 0
+
+    for orig_word, res_word in zip(original_words, result_words):
+        if orig_word == res_word:
+            orig_parts.append(html.escape(orig_word))
+            res_parts.append(html.escape(res_word))
+            continue
+        changed_words += 1
+        o_html, r_html, c_count = diff_word(orig_word, res_word)
+        changed_chars += c_count
+        orig_parts.append(o_html)
+        res_parts.append(r_html)
+
+    return " ".join(orig_parts), " ".join(res_parts), changed_words, changed_chars
+
+
 class OCRDenoiser:
-    def __init__(self, checkpoint_path: str, charset_path: str, words_path: str = None):
+    def __init__(
+        self,
+        checkpoint_path: str,
+        charset_path: str,
+        words_path: Optional[str] = None,
+        config: Optional[dict] = None,
+    ):
         self.device = "cuda" if torch.cuda.is_available() else "cpu"
-
-        # Загрузка vocab
         self.vocab = CharVocab(charset_path)
+        self.edit_vocab = EditVocab(self.vocab)
 
-        # Загрузка словаря слов
         self.word_dict = set()
         if words_path and Path(words_path).exists():
             with open(words_path, encoding="utf-8") as f:
@@ -76,101 +173,66 @@ class OCRDenoiser:
                     if word:
                         self.word_dict.add(word)
 
-        # Загрузка модели
-        ckpt = torch.load(checkpoint_path, map_location=self.device)
-        config = ckpt.get("config", {})
+        self.model, self.max_len = self._load_model(checkpoint_path, config or {})
 
-        self.model = CharTransformerMLM(
+    def _load_model(self, checkpoint_path: str, config: dict):
+        ckpt = torch.load(checkpoint_path, map_location=self.device)
+
+        if isinstance(ckpt, dict) and "model" in ckpt:
+            state_dict = ckpt["model"]
+            config = {**config, **ckpt.get("config", {})}
+        else:
+            state_dict = ckpt
+
+        emb_size = state_dict["char_emb.weight"].shape[1]
+        max_len = state_dict["pos_emb.weight"].shape[0]
+
+        n_layers = config.get("n_layers", 6)
+        n_heads = config.get("n_heads", 6)
+        ffn_size = config.get("ffn_size", 768)
+        dropout = config.get("dropout", 0.1)
+
+        model = CharTransformerEdit(
             vocab_size=len(self.vocab.token_to_id),
-            emb_size=config.get("emb_size", 192),
-            n_layers=config.get("n_layers", 6),
-            n_heads=config.get("n_heads", 6),
-            ffn_size=config.get("ffn_size", 768),
-            dropout=0.0,  # При инференсе dropout=0
+            edit_vocab_size=self.edit_vocab.size,
+            emb_size=emb_size,
+            max_len=max_len,
+            n_layers=n_layers,
+            n_heads=n_heads,
+            ffn_size=ffn_size,
+            dropout=dropout,
             pad_idx=self.vocab.pad,
             eow_idx=self.vocab.eow,
         ).to(self.device)
 
-        self.model.load_state_dict(ckpt["model"])
-        self.model.eval()
+        model.load_state_dict(state_dict)
+        model.eval()
 
-        print(f"Модель загружена: {checkpoint_path}")
-        print(f"Словарь: {len(self.word_dict)} слов")
+        return model, max_len
 
-    def process_window(self, text: str) -> tuple[str, list[tuple[int, int, str, str]]]:
-        """
-        Обработать окно текста.
-        Возвращает: (исправленный текст, список изменений [(word_idx, char_idx, было, стало)])
-        """
-        words = text.split()
-        if not words:
-            return text, []
-
-        # Кодируем: слово + EOW для каждого
-        ids = []
-        word_boundaries = []
-
+    def _encode_words(self, words: List[str]) -> List[int]:
+        ids: List[int] = []
         for word in words:
-            start = len(ids)
-            word_ids = self.vocab.encode(word)
-            ids.extend(word_ids)
+            ids.extend(self.vocab.encode(word))
             ids.append(self.vocab.eow)
-            word_boundaries.append((start, len(ids) - 1))
+        return ids
 
+    def _predict_window(self, words: List[str], ids: List[int]) -> Optional[List[str]]:
         if not ids:
-            return text, []
+            return words
 
-        # Прогоняем через модель
         x = torch.tensor([ids], device=self.device)
-        y_dummy = torch.full_like(x, -100)
-
         with torch.no_grad():
-            logits, _ = self.model(x, y_dummy)
+            logits, _ = self.model(x)
 
-            # Применяем маску EOW
-            eow = self.vocab.eow
-            mask = (x != eow) & (y_dummy == -100)
-            logits[..., eow] -= mask * 1e9
-            eow_positions = x == eow
-            non_eow_mask = torch.ones_like(logits, dtype=torch.bool)
-            non_eow_mask[..., eow] = False
-            logits[eow_positions.unsqueeze(-1).expand_as(logits) & non_eow_mask] -= 1e9
+        pred_ops = logits.argmax(dim=-1)[0].tolist()
+        pred_text = apply_edit_ops(self.vocab, self.edit_vocab, ids, pred_ops)
+        pred_words = [w for w in pred_text.split("<EOW>") if w]
 
-            preds = logits.argmax(dim=-1)[0].tolist()
+        if len(pred_words) != len(words):
+            return None
 
-        # Собираем исправленные слова
-        changes = []
-        result_words = []
-
-        for word_idx, (start, end) in enumerate(word_boundaries):
-            orig_word = words[word_idx]
-            pred_ids = preds[start : end + 1]
-            pred_ids = [p for p in pred_ids if p != self.vocab.eow]
-
-            if len(pred_ids) != len(self.vocab.encode(orig_word)):
-                result_words.append(orig_word)
-                continue
-
-            pred_word = self.vocab.decode(pred_ids)
-
-            # Убираем множественные пробелы (артефакты удаления символов)
-            pred_word = " ".join(pred_word.split())
-
-            orig_ids = self.vocab.encode(orig_word)
-            for i, (oi, pi) in enumerate(zip(orig_ids, pred_ids)):
-                if oi != pi:
-                    changes.append(
-                        (
-                            word_idx,
-                            i,
-                            self.vocab.id_to_token[oi],
-                            self.vocab.id_to_token[pi],
-                        )
-                    )
-
-            result_words.append(pred_word)
-
-        return " ".join(result_words), changes
+        return pred_words
 
     def process_text(
         self,
@@ -179,172 +241,106 @@ class OCRDenoiser:
         overlap: int = 1,
         iterations: int = 1,
         check_dictionary: bool = False,
-    ) -> tuple[str, str, str]:
-        """
-        Обработать текст скользящим окном.
-        Возвращает: (оригинал_html, результат_html, статистика)
-        """
+    ) -> Tuple[str, str, str]:
         original_words = text.split()
         if not original_words:
-            return text, text, "Пустой текст"
+            return text, text, "Empty input."
 
         result_words = list(original_words)
-        all_changes = []  # (word_idx, char_idx, old, new)
         actual_iterations = 0
 
-        # Повторные итерации
         for iteration in range(iterations):
             actual_iterations = iteration + 1
-            iteration_changes = []
+            iteration_changes = 0
             pos = 0
             attempts = 0
             max_attempts = len(result_words) * 2
 
             while pos < len(result_words) and attempts < max_attempts:
                 attempts += 1
+                window_end = min(pos + window_size, len(result_words))
+                window_words = result_words[pos:window_end]
+                ids = self._encode_words(window_words)
 
-                end = min(pos + window_size, len(result_words))
-                window_words = result_words[pos:end]
-                window_text = " ".join(window_words)
+                while window_words and len(ids) > self.max_len:
+                    window_end -= 1
+                    window_words = result_words[pos:window_end]
+                    ids = self._encode_words(window_words)
 
-                corrected_text, changes = self.process_window(window_text)
-                corrected_words = corrected_text.split()
-
-                if len(corrected_words) != len(window_words):
+                if not window_words or len(ids) > self.max_len:
                     pos += 1
                     continue
 
-                for word_idx, char_idx, old_char, new_char in changes:
-                    global_word_idx = pos + word_idx
-                    new_word = corrected_words[word_idx]
+                corrected_words = self._predict_window(window_words, ids)
+                if corrected_words is None or len(corrected_words) != len(window_words):
+                    pos += 1
+                    continue
 
+                for i, new_word in enumerate(corrected_words):
+                    global_idx = pos + i
                     if check_dictionary and self.word_dict:
-                        if new_word.lower().strip(".,;:!?\"'()") not in self.word_dict:
+                        cleaned = new_word.lower().strip(".,;:!?\"'()[]{}")
+                        if cleaned and cleaned not in self.word_dict:
                             continue
+                    if new_word != result_words[global_idx]:
+                        iteration_changes += 1
+                        result_words[global_idx] = new_word
 
-                    result_words[global_word_idx] = new_word
-                    iteration_changes.append(
-                        (global_word_idx, char_idx, old_char, new_char)
-                    )
+                step = max(len(window_words) - overlap, 1)
+                pos += step
 
-                pos += window_size - overlap
-                if pos >= len(result_words):
-                    break
-
-            all_changes.extend(iteration_changes)
-
-            # Если в этой итерации не было изменений - выходим
-            if not iteration_changes:
+            if iteration_changes == 0:
                 break
 
-        # Формируем HTML для оригинала (красная подсветка - что было)
-        orig_html_parts = []
-        changed_word_indices = set(c[0] for c in all_changes)
+        orig_html, result_html, changed_words, changed_chars = diff_words(
+            original_words, result_words
+        )
 
-        for i, word in enumerate(original_words):
-            if i in changed_word_indices:
-                word_changes = [(c[1], c[2], c[3]) for c in all_changes if c[0] == i]
-                highlighted = self._highlight_word_original(word, word_changes)
-                orig_html_parts.append(highlighted)
-            else:
-                orig_html_parts.append(word)
-
-        orig_html = " ".join(orig_html_parts)
-
-        # Формируем HTML для результата (зелёная подсветка - что стало)
-        result_html_parts = []
-        for i, word in enumerate(result_words):
-            if i in changed_word_indices:
-                word_changes = [(c[1], c[2], c[3]) for c in all_changes if c[0] == i]
-                highlighted = self._highlight_word_result(word, word_changes)
-                result_html_parts.append(highlighted)
-            else:
-                result_html_parts.append(word)
-
-        result_html = " ".join(result_html_parts)
-
-        # Статистика
-        stats = f"Обработано слов: {len(original_words)}\n"
-        stats += f"Итераций: {actual_iterations}\n"
-        stats += f"Изменений: {len(all_changes)}\n"
-        if all_changes:
-            stats += "\nЗамены:\n"
-            for word_idx, char_idx, old_char, new_char in all_changes[:30]:
-                stats += f"  '{old_char}' → '{new_char}' (слово #{word_idx})\n"
-            if len(all_changes) > 30:
-                stats += f"  ... и ещё {len(all_changes) - 30}\n"
+        stats = f"Words: {len(original_words)}\n"
+        stats += f"Iterations: {actual_iterations}\n"
+        stats += f"Changed words: {changed_words}\n"
+        stats += f"Changed chars: {changed_chars}\n"
 
         return orig_html, result_html, stats
 
-    def _highlight_word_original(self, word: str, changes: list) -> str:
-        """Подсветить в оригинале что было заменено (красным)"""
-        if not changes:
-            return word
 
-        # changes: [(char_idx, old, new), ...]
-        change_map = {c[0]: c[1] for c in changes}  # char_idx -> old_char
-
-        result = []
-        for i, char in enumerate(word):
-            if i in change_map:
-                result.append(
-                    f'<span style="background-color: #FFB6C1; font-weight: bold; text-decoration: line-through;">{char}</span>'
-                )
-            else:
-                result.append(char)
-
-        return "".join(result)
-
-    def _highlight_word_result(self, word: str, changes: list) -> str:
-        """Подсветить в результате что стало (зелёным)"""
-        if not changes:
-            return word
-
-        changed_positions = {c[0] for c in changes}
-
-        result = []
-        for i, char in enumerate(word):
-            if i in changed_positions:
-                result.append(
-                    f'<span style="background-color: #90EE90; font-weight: bold;">{char}</span>'
-                )
-            else:
-                result.append(char)
-
-        return "".join(result)
-
-
-# Глобальный экземпляр
 denoiser = None
 
 
 def load_model():
     global denoiser
     try:
-        denoiser = OCRDenoiser(DEFAULT_CHECKPOINT, DEFAULT_CHARSET, DEFAULT_WORDS)
-        return f"✅ Модель загружена!\nУстройство: {denoiser.device}\nСловарь: {len(denoiser.word_dict)} слов"
+        config = load_training_config()
+        denoiser = OCRDenoiser(DEFAULT_CHECKPOINT, DEFAULT_CHARSET, DEFAULT_WORDS, config)
+        return (
+            "OK: model loaded\n"
+            f"Device: {denoiser.device}\n"
+            f"Dictionary size: {len(denoiser.word_dict)}\n"
+            f"Max length: {denoiser.max_len}"
+        )
     except Exception as e:
-        return f"❌ Ошибка загрузки: {str(e)}"
+        return f"ERROR: failed to load model: {str(e)}"
 
 
 def process(text, window_size, overlap, iterations, check_dict, fix_hyphens):
     if denoiser is None:
-        return "Модель не загружена!", "", ""
+        return "Model is not loaded.", "", ""
 
     try:
         preprocess_stats = ""
 
-        # Препроцессинг переносов
         if fix_hyphens:
             text, hyphen_changes = preprocess_hyphen_breaks(text)
             if hyphen_changes:
                 preprocess_stats = (
-                    f"Препроцессинг переносов: {len(hyphen_changes)} замен\n"
+                    f"Preprocess fixes: {len(hyphen_changes)}\n"
                 )
                 for old, new in hyphen_changes[:10]:
-                    preprocess_stats += f"  '{old}' → '{new}'\n"
+                    preprocess_stats += f"  '{old}' -> '{new}'\n"
                 if len(hyphen_changes) > 10:
-                    preprocess_stats += f"  ... и ещё {len(hyphen_changes) - 10}\n"
+                    preprocess_stats += (
+                        f"  ... plus {len(hyphen_changes) - 10} more\n"
+                    )
                 preprocess_stats += "\n"
 
         orig_html, result_html, stats = denoiser.process_text(
@@ -356,67 +352,76 @@ def process(text, window_size, overlap, iterations, check_dict, fix_hyphens):
         )
         return orig_html, result_html, preprocess_stats + stats
     except Exception as e:
-        return f"Ошибка: {str(e)}", "", ""
+        return f"ERROR: {str(e)}", "", ""
 
 
 def create_app():
-    # Загружаем модель при старте
     status = load_model()
     print(status)
 
     with gr.Blocks(
-        title="OCR Denoiser", css=".output-html { font-size: 16px; line-height: 1.8; }"
+        title="OCR Denoiser (Edit Model)",
+        css=".output-html { font-size: 16px; line-height: 1.8; }",
     ) as app:
-        gr.Markdown("# 🔧 OCR Denoising Model Tester")
-
-        # Статус модели
-        gr.Markdown(f"**Статус:** {status}")
+        gr.Markdown("# OCR Edit Model Tester")
+        gr.Markdown(f"**Model status:** {status}")
 
         gr.Markdown("---")
 
         with gr.Row():
             with gr.Column(scale=1):
-                gr.Markdown("### ⚙️ Настройки")
+                gr.Markdown("### Settings")
                 window_size = gr.Slider(
-                    minimum=1, maximum=10, value=7, step=1, label="Размер окна (слов)"
+                    minimum=1,
+                    maximum=12,
+                    value=7,
+                    step=1,
+                    label="Window size (words)",
                 )
                 overlap = gr.Slider(
-                    minimum=0, maximum=5, value=2, step=1, label="Пересечение окон"
+                    minimum=0,
+                    maximum=6,
+                    value=2,
+                    step=1,
+                    label="Window overlap (words)",
                 )
                 iterations = gr.Slider(
-                    minimum=1, maximum=5, value=1, step=1, label="Повторные итерации"
+                    minimum=1,
+                    maximum=5,
+                    value=1,
+                    step=1,
+                    label="Iterations",
                 )
                 check_dict = gr.Checkbox(
-                    label="🔍 Проверять слова по словарю", value=False
+                    label="Filter edits by dictionary", value=False
                 )
                 fix_hyphens = gr.Checkbox(
-                    label="✂️ Исправлять артефакты переносов (-,  ,слово)", value=True
+                    label="Preprocess hyphen/comma breaks", value=True
                 )
 
         gr.Markdown("---")
 
         input_text = gr.Textbox(
-            label="📝 Входной текст (с ошибками OCR)",
+            label="Input text",
             lines=5,
-            placeholder="Вставьте текст с ошибками OCR...",
+            placeholder="Paste OCR text here...",
         )
 
-        process_btn = gr.Button("🚀 Исправить", variant="primary", size="lg")
+        process_btn = gr.Button("Process", variant="primary", size="lg")
 
         gr.Markdown("---")
 
         with gr.Row():
             with gr.Column():
-                gr.Markdown("### ❌ Оригинал (красным — что заменено)")
+                gr.Markdown("### Original (highlighted)")
                 orig_output = gr.HTML(elem_classes=["output-html"])
             with gr.Column():
-                gr.Markdown("### ✅ Результат (зелёным — исправления)")
+                gr.Markdown("### Corrected (highlighted)")
                 result_output = gr.HTML(elem_classes=["output-html"])
 
         with gr.Row():
-            stats_output = gr.Textbox(label="📊 Статистика", lines=10)
+            stats_output = gr.Textbox(label="Stats", lines=10)
 
-        # События
         process_btn.click(
             process,
             inputs=[
@@ -428,22 +433,6 @@ def create_app():
                 fix_hyphens,
             ],
             outputs=[orig_output, result_output, stats_output],
-        )
-
-        # Примеры
-        gr.Markdown("### 📋 Примеры")
-        gr.Examples(
-            examples=[
-                ["Директоръ обсужЭаетъ теплѮцу въ саду"],
-                ["Баянчикъ вскрикнулъ вскочилъ ХуPѵо"],
-                ["фицер-, ,скихъ чиновъ было много"],
-                ["занимается ается кресть-, евъ мазуровъ"],
-                ["сло- во разорвано переносомъ строки"],
-                ["развивая- ясь понемногу"],
-                ["году въ Губерніи нахxдилозь много людей и животныхъ"],
-                ["стороны. Незнакоіецъ въ темЩомалиновомГ платьѣ"],
-            ],
-            inputs=input_text,
         )
 
     return app

@@ -39,8 +39,18 @@ class CharVocab:
             ):
                 self.mlm_replace_ids.append(self.token_to_id[ch])
 
+        self.digit = self.token_to_id.get("<DIGIT>")
+        if self.digit is None:
+            raise ValueError("В charset.txt должен быть <DIGIT>")
+
     def encode(self, text: str) -> List[int]:
-        return [self.token_to_id[ch] for ch in text if ch in self.token_to_id]
+        ids = []
+        for ch in text:
+            if ch.isdigit():
+                ids.append(self.digit)
+            elif ch in self.token_to_id:
+                ids.append(self.token_to_id[ch])
+        return ids
 
     def decode(self, ids: List[int]) -> str:
         return "".join(self.id_to_token[i] for i in ids)

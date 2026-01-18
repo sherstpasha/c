@@ -1,486 +1,646 @@
 import csv
 import random
-from collections import Counter
-from typing import List, Tuple
+from collections import Counter, defaultdict
+from typing import List, Tuple, Optional
 
 import torch
 from torch.utils.data import Dataset
 
 
-def is_good_pair(src: str, tgt: str) -> bool:
-    if len(src) != len(tgt):
-        return False
-
-    if not any(ch.isalpha() for ch in src + tgt):
-        return False
-
-    digit_ratio = sum(ch.isdigit() for ch in src + tgt) / max(1, len(src) + len(tgt))
-    if digit_ratio > 0.3:
-        return False
-
-    return True
+# ============================================================
+# Endings (optional)
+# ============================================================
 
 
 def extract_top_endings(
-    words_path: str, top_n: int = 50, min_len: int = 2, max_len: int = 4
+    words_path: str,
+    min_len: int = 2,
+    max_len: int = 5,
+    min_freq: int = 30,
+    top_k: int = 120,
 ) -> List[str]:
-    """Извлечь топ окончаний из словаря"""
-    endings_counter = Counter()
-
+    counter = Counter()
     with open(words_path, encoding="utf-8") as f:
         for line in f:
-            word = line.strip().lower()
-            if len(word) >= 4:
-                for end_len in range(min_len, min(max_len + 1, len(word))):
-                    endings_counter[word[-end_len:]] += 1
+            w = line.strip()
+            if len(w) < min_len + 1:
+                continue
+            for L in range(min_len, min(max_len + 1, len(w))):
+                end = w[-L:]
+                # только буквенные окончания (для дореформенной орфографии это нормально)
+                if end.isalpha():
+                    counter[end] += 1
+    endings = [e for e, c in counter.items() if c >= min_freq]
+    endings.sort(key=lambda e: counter[e], reverse=True)
+    return endings[:top_k]
 
-    top_endings = [e for e, cnt in endings_counter.most_common(top_n * 3) if cnt > 100]
-    return top_endings[:top_n]
+
+# ============================================================
+# Levenshtein -> edit ops
+# ============================================================
 
 
-class CharOCRDenoiseDataset(Dataset):
+def levenshtein_ops(src: List[int], tgt: List[int], edit_vocab) -> List[int]:
+    """
+    src, tgt: char ids (already encoded by CharVocab; digits -> <DIGIT>, word boundaries -> <EOW>)
+    returns: op ids, length == len(src)
+    """
+    n, m = len(src), len(tgt)
+    if n == 0:
+        return []
+
+    dp = [[0] * (m + 1) for _ in range(n + 1)]
+    back = [[None] * (m + 1) for _ in range(n + 1)]
+
+    for i in range(n + 1):
+        dp[i][0] = i
+        back[i][0] = "DEL"
+    for j in range(m + 1):
+        dp[0][j] = j
+        back[0][j] = "INS"
+    back[0][0] = None
+
+    for i in range(1, n + 1):
+        si = src[i - 1]
+        for j in range(1, m + 1):
+            tj = tgt[j - 1]
+            if si == tj:
+                dp[i][j] = dp[i - 1][j - 1]
+                back[i][j] = "COPY"
+            else:
+                choices = [
+                    (dp[i - 1][j] + 1, "DEL"),
+                    (dp[i][j - 1] + 1, "INS"),
+                    (dp[i - 1][j - 1] + 1, "REP"),
+                ]
+                dp[i][j], back[i][j] = min(choices, key=lambda x: x[0])
+
+    ops = []
+    i, j = n, m
+
+    char_vocab = edit_vocab.char_vocab
+    digit_id = char_vocab.token_to_id.get("<DIGIT>")
+
+    while i > 0:
+        op = back[i][j]
+
+        if op == "COPY":
+            ops.append(edit_vocab.COPY)
+            i -= 1
+            j -= 1
+
+        elif op == "REP":
+            tgt_id = tgt[j - 1]
+            ch = char_vocab.id_to_token[tgt_id]
+
+            # Запрещаем правки цифр, <EOW>, и всего, чего нет в EditVocab
+            rep_key = f"REPLACE_{ch}"
+            if (
+                tgt_id == digit_id
+                or ch == "<EOW>"
+                or rep_key not in edit_vocab.op_to_id
+            ):
+                ops.append(edit_vocab.COPY)
+            else:
+                ops.append(edit_vocab.op_to_id[rep_key])
+
+            i -= 1
+            j -= 1
+
+        elif op == "DEL":
+            ops.append(edit_vocab.DELETE)
+            i -= 1
+
+        elif op == "INS":
+            tgt_id = tgt[j - 1]
+            ch = char_vocab.id_to_token[tgt_id]
+
+            ins_key = f"INSERT_{ch}"
+            # цифры и <EOW> не вставляем, и не вставляем то, чего нет в EditVocab
+            if (
+                tgt_id == digit_id
+                or ch == "<EOW>"
+                or ins_key not in edit_vocab.op_to_id
+            ):
+                j -= 1
+                continue
+            else:
+                ops.append(edit_vocab.op_to_id[ins_key])
+                j -= 1
+
+        else:
+            # на всякий случай (не должно случаться)
+            ops.append(edit_vocab.COPY)
+            i -= 1
+
+    ops.reverse()
+    # длина ops может стать меньше n (из-за пропущенных INS по <EOW>/<DIGIT>), добиваем COPY
+    if len(ops) < n:
+        ops = [edit_vocab.COPY] * (n - len(ops)) + ops
+    return ops[:n]
+
+
+# ============================================================
+# Dataset
+# ============================================================
+
+
+class CharOCREditDataset(Dataset):
+    """
+    Два источника:
+    1) clean text -> аугментации
+    2) real OCR pairs (grouped by image) -> окно с гарантированной ошибкой
+    """
+
     def __init__(
         self,
         text_path: str,
-        pairs_csv_path: str,
         vocab,
-        words_path: str = None,
+        edit_vocab,
+        pairs_csv_path: Optional[str] = None,
+        words_path: Optional[str] = None,
         max_len: int = 128,
-        max_words: int = 3,
-        noise_prob: float = 0.15,
-        p_real: float = 0.4,
-        p_ending_swap: float = 0.03,
-        p_extra_punct: float = 0.02,
-        p_hyphen_comma: float = 0.015,
-        p_comma_prefix: float = 0.01,
-        p_repeat_ending: float = 0.01,
-        p_single_hyphen: float = 0.02,
+        max_words: int = 8,
+        noise_prob: float = 0.25,
+        ocr_window: Optional[int] = None,
+        # probabilities (normalised inside __getitem__)
+        p_real_ocr: float = 0.30,
+        p_synthetic_noise: float = 0.20,
+        p_ending_swap: float = 0.15,
+        p_extra_punct: float = 0.10,
+        p_hyphen_break: float = 0.10,
+        p_comma_prefix: float = 0.10,
+        p_repeat_ending: float = 0.05,
+        p_repeat_beginning: float = 0.05,
+        ending_swap_prob_min: float = 0.08,
+        ending_swap_prob_max: float = 0.12,
+        # train/val split
+        split: str = "train",
+        val_indices_lines: Optional[set] = None,
+        val_indices_pairs: Optional[set] = None,
     ):
         self.vocab = vocab
+        self.edit_vocab = edit_vocab
         self.max_len = max_len
         self.max_words = max_words
         self.noise_prob = noise_prob
-        self.p_real = p_real
-        self.ocr_window = 2
+        self.ocr_window = ocr_window if ocr_window is not None else max_words
+
+        # aug probs
+        self.p_real_ocr = p_real_ocr
+        self.p_synthetic_noise = p_synthetic_noise
         self.p_ending_swap = p_ending_swap
         self.p_extra_punct = p_extra_punct
-        self.p_hyphen_comma = p_hyphen_comma
+        self.p_hyphen_break = p_hyphen_break
         self.p_comma_prefix = p_comma_prefix
         self.p_repeat_ending = p_repeat_ending
-        self.p_single_hyphen = p_single_hyphen
+        self.p_repeat_beginning = p_repeat_beginning
+        self.ending_swap_prob_min = ending_swap_prob_min
+        self.ending_swap_prob_max = ending_swap_prob_max
+        
+        # train/val split
+        self.split = split
+        self.val_indices_lines = val_indices_lines or set()
+        self.val_indices_pairs = val_indices_pairs or set()
 
+        # clean text - загружаем все, потом фильтруем
         with open(text_path, encoding="utf-8") as f:
-            self.lines = [l.strip() for l in f if l.strip()]
+            all_lines = [l.strip() for l in f if l.strip()]
+        
+        # Фильтруем по split
+        if split == "train":
+            self.lines = [l for i, l in enumerate(all_lines) if i not in self.val_indices_lines]
+        elif split == "val":
+            self.lines = [l for i, l in enumerate(all_lines) if i in self.val_indices_lines]
+        else:  # "all"
+            self.lines = all_lines
+            
+        if not self.lines:
+            raise ValueError(f"text_path пустой: нет строк для split={split}")
 
-        self.pairs: List[Tuple[str, str]] = []
-        with open(pairs_csv_path, encoding="utf-8") as f:
-            reader = csv.reader(f)
-            for row in reader:
-                if len(row) < 3:
-                    continue
-                _, src, tgt = row[0], row[1].strip(), row[2].strip()
-                if src and tgt and is_good_pair(src, tgt):
-                    self.pairs.append((src, tgt))
-
-        if not self.pairs:
-            raise ValueError("Нет валидных OCR-пар после фильтрации")
-
-        self.replace_ids = vocab.mlm_replace_ids
-
+        # endings
         self.top_endings = []
         if words_path:
             try:
                 self.top_endings = extract_top_endings(words_path)
             except Exception:
-                pass
+                self.top_endings = []
 
-        self.extra_punct = [",", ".", ";", "-"]
-        self.punct_ids = [
-            vocab.token_to_id.get(p) for p in self.extra_punct if p in vocab.token_to_id
-        ]
+        # real OCR pairs
+        self.pairs_by_image: dict[str, List[Tuple[str, str]]] = {}
+        self.error_refs: List[Tuple[str, int]] = []  # (image, idx_in_image)
+        self.all_pairs_list: List[Tuple[str, str, str]] = []  # (image, src, tgt) для фильтрации по split
 
-    def __len__(self):
-        return max(len(self.lines), len(self.pairs))
+        if pairs_csv_path:
+            self._load_pairs_csv(pairs_csv_path)
 
-    def _apply_synthetic_noise(self, ids: List[int]):
-        x = ids.copy()
-        y = [-100] * len(ids)
+    # -----------------------------
+    # CSV loading (robust)
+    # -----------------------------
 
-        for i in range(len(ids)):
-            if ids[i] == self.vocab.eow:
-                continue
-            if random.random() < self.noise_prob:
-                y[i] = ids[i]
-                x[i] = random.choice(self.replace_ids)
+    def _load_pairs_csv(self, pairs_csv_path: str):
+        grouped = defaultdict(list)
 
-        return x, y
+        with open(pairs_csv_path, encoding="utf-8") as f:
+            # ждём header: image,incorrect,correct
+            reader = csv.DictReader(f)
+            # если header не распознался (странный csv) — fallback на обычный reader
+            if reader.fieldnames is None or not {
+                "image",
+                "incorrect",
+                "correct",
+            }.issubset(set(reader.fieldnames)):
+                f.seek(0)
+                r = csv.reader(f)
+                for row in r:
+                    if len(row) < 3:
+                        continue
+                    # heuristics: skip header row
+                    if row[0].lower() == "image" and row[1].lower() == "incorrect":
+                        continue
+                    img, src, tgt = row[0], row[1], row[2]
+                    if self._is_valid_pair(src, tgt):
+                        grouped[img].append((src, tgt))
+            else:
+                for row in reader:
+                    img = (row.get("image") or "").strip()
+                    src = (row.get("incorrect") or "").strip()
+                    tgt = (row.get("correct") or "").strip()
+                    if not img:
+                        continue
+                    if self._is_valid_pair(src, tgt):
+                        grouped[img].append((src, tgt))
 
-    def _real_pair_window(self):
-        i = random.randint(0, len(self.pairs) - self.ocr_window)
+        # Сохраняем все пары с индексами для фильтрации
+        pair_idx = 0
+        for img, pairs in grouped.items():
+            for src, tgt in pairs:
+                self.all_pairs_list.append((img, src, tgt, pair_idx))
+                pair_idx += 1
+        
+        # Фильтруем по split
+        if self.split == "train":
+            filtered_pairs = [(img, src, tgt) for img, src, tgt, idx in self.all_pairs_list if idx not in self.val_indices_pairs]
+        elif self.split == "val":
+            filtered_pairs = [(img, src, tgt) for img, src, tgt, idx in self.all_pairs_list if idx in self.val_indices_pairs]
+        else:  # "all"
+            filtered_pairs = [(img, src, tgt) for img, src, tgt, _ in self.all_pairs_list]
+        
+        # Перестраиваем groups после фильтрации
+        grouped_filtered = defaultdict(list)
+        for img, src, tgt in filtered_pairs:
+            grouped_filtered[img].append((src, tgt))
+        
+        # чистим пустые группы и собираем error refs
+        self.pairs_by_image = {img: pairs for img, pairs in grouped_filtered.items() if pairs}
+        self.error_refs = []
+        for img, pairs in self.pairs_by_image.items():
+            for i, (s, t) in enumerate(pairs):
+                if s != t:
+                    self.error_refs.append((img, i))
 
-        xs = []
-        ys = []
-
-        for j in range(self.ocr_window):
-            src, tgt = self.pairs[i + j]
-
-            x = self.vocab.encode(src)
-            y = self.vocab.encode(tgt)
-
-            if len(x) == 0:
-                continue
-
-            for xi, yi in zip(x, y):
-                xs.append(xi)
-                ys.append(yi if xi != yi else -100)
-
-            xs.append(self.vocab.eow)
-            ys.append(-100)
-
-        xs = xs[: self.max_len]
-        ys = ys[: self.max_len]
-
-        return xs, ys
-
-    def _maybe_swap_ending(self, word: str) -> Tuple[str, str]:
-        """Иногда заменяет окончание слова на другое из топ-окончаний"""
-        if not self.top_endings or len(word) < 5:
-            return word, word
-
-        if random.random() > self.p_ending_swap:
-            return word, word
-
-        for ending in self.top_endings:
-            if word.endswith(ending) and len(word) > len(ending) + 1:
-                same_len_endings = [
-                    e for e in self.top_endings if len(e) == len(ending) and e != ending
-                ]
-                if same_len_endings:
-                    new_ending = random.choice(same_len_endings)
-                    noisy = word[: -len(ending)] + new_ending
-                    return noisy, word
-                break
-
-        return word, word
-
-    def _maybe_add_punct(
-        self, ids: List[int], targets: List[int]
-    ) -> Tuple[List[int], List[int]]:
-        if not self.punct_ids:
-            return ids, targets
-
-        x = ids.copy()
-        y = targets.copy()
-
-        for i in range(1, len(x) - 1):
-            if x[i] != self.vocab.eow and random.random() < self.p_extra_punct:
-                y[i] = ids[i]
-                x[i] = random.choice(self.punct_ids)
-
-        return x, y
-
-    def _apply_hyphen_artifacts(
-        self, ids: List[int], targets: List[int]
-    ) -> Tuple[List[int], List[int]]:
-
-        if " " not in self.vocab.token_to_id:
-            return ids, targets
-
-        space_id = self.vocab.token_to_id[" "]
-        comma_id = self.vocab.token_to_id.get(",")
-        hyphen_id = self.vocab.token_to_id.get("-")
-
-        if comma_id is None or hyphen_id is None:
-            return ids, targets
-
-        x = ids.copy()
-        y = targets.copy()
-
-        eow_positions = [
-            i for i, token_id in enumerate(ids) if token_id == self.vocab.eow
-        ]
-
-        for eow_idx in eow_positions:
-            if eow_idx >= 3 and random.random() < self.p_hyphen_comma:
-                if (
-                    x[eow_idx - 1] != self.vocab.eow
-                    and x[eow_idx - 2] != self.vocab.eow
-                    and x[eow_idx - 3] != self.vocab.eow
-                ):
-                    y[eow_idx - 2] = space_id
-                    y[eow_idx - 1] = space_id
-                    x[eow_idx - 2] = hyphen_id
-                    x[eow_idx - 1] = comma_id
-
-            if (
-                eow_idx + 1 < len(x)
-                and x[eow_idx + 1] != self.vocab.eow
-                and random.random() < self.p_comma_prefix
-            ):
-                y[eow_idx + 1] = space_id
-                x[eow_idx + 1] = comma_id
-
-        for eow_idx in eow_positions[:-1]:
-            if random.random() < self.p_repeat_ending and eow_idx >= 4:
-                dup_len = random.randint(2, 3)
-                if eow_idx >= dup_len + 1:
-                    next_word_start = eow_idx + 1
-                    if next_word_start + dup_len < len(x):
-                        for j in range(dup_len):
-                            orig_id = x[eow_idx - dup_len + j]
-                            if orig_id != self.vocab.eow and next_word_start + j < len(
-                                x
-                            ):
-                                x[next_word_start + j] = orig_id
-                                y[next_word_start + j] = space_id
-
-        for eow_idx in eow_positions[:-1]:
-            if eow_idx >= 3 and random.random() < self.p_single_hyphen:
-                if (
-                    x[eow_idx - 1] != hyphen_id
-                    and x[eow_idx - 1] != self.vocab.eow
-                    and x[eow_idx - 2] != self.vocab.eow
-                ):
-                    y[eow_idx - 1] = space_id
-                    x[eow_idx - 1] = hyphen_id
-
-        return x, y
-
-    def __getitem__(self, idx):
-        if random.random() < self.p_real:
-            x, y = self._real_pair_window()
-            return (
-                torch.tensor(x, dtype=torch.long),
-                torch.tensor(y, dtype=torch.long),
+        # если real OCR недоступен — просто отключим p_real_ocr в __getitem__ нормализацией
+        # (без исключения, чтобы можно было тренить чисто на синтетике)
+        # но полезно предупредить:
+        if pairs_csv_path and not self.error_refs:
+            print(
+                f"[dataset split={self.split}] Warning: no real OCR errors found after filtering (src != tgt). Real OCR disabled."
             )
 
-        line = self.lines[idx % len(self.lines)]
-        words = line.split()
+    def _is_valid_pair(self, src: str, tgt: str) -> bool:
+        # пустые/NaN строки — в мусор
+        if not src or not tgt:
+            return False
+        if src.strip().lower() == "nan" or tgt.strip().lower() == "nan":
+            return False
+        # иногда из pandas пролезает "None"
+        if src.strip().lower() == "none" or tgt.strip().lower() == "none":
+            return False
 
-        if not words:
-            return self.__getitem__(idx + 1)
+        # запрещаем угловые скобки, чтобы не ловить REPLACE_< и т.п.
+        if "<" in src or ">" in src or "<" in tgt or ">" in tgt:
+            return False
 
-        if len(words) > self.max_words:
-            start = random.randint(0, len(words) - self.max_words)
-            words = words[start : start + self.max_words]
+        # все нецифровые символы должны быть в charset
+        for ch in src + tgt:
+            if ch.isdigit():
+                continue
+            if ch not in self.vocab.token_to_id:
+                return False
+        return True
 
-        ids = []
-        targets = []
+    # -----------------------------
 
-        for i, w in enumerate(words):
-            if 0 < i < len(words) - 1:
-                noisy_w, clean_w = self._maybe_swap_ending(w)
-            else:
-                noisy_w, clean_w = w, w
+    def __len__(self):
+        # делаем "бесконечность" через max из источников
+        real_len = (
+            sum(len(v) for v in self.pairs_by_image.values())
+            if self.pairs_by_image
+            else 0
+        )
+        return max(len(self.lines), real_len) if real_len > 0 else len(self.lines)
 
-            noisy_ids = self.vocab.encode(noisy_w)
-            clean_ids = self.vocab.encode(clean_w)
+    # ==================================================
+    # Sampling
+    # ==================================================
 
-            if len(noisy_ids) == len(clean_ids):
-                for ni, ci in zip(noisy_ids, clean_ids):
-                    ids.append(ni)
-                    targets.append(ci if ni != ci else -100)
-            else:
-                ids.extend(self.vocab.encode(w))
-                targets.extend([-100] * len(self.vocab.encode(w)))
+    def __getitem__(self, idx):
+        augs = []
 
-            ids.append(self.vocab.eow)
-            targets.append(-100)
+        # real OCR только если реально есть ошибки
+        if self.error_refs:
+            augs.append(("real_ocr", self.p_real_ocr))
 
-        ids = ids[: self.max_len]
-        targets = targets[: self.max_len]
-
-        x, y = self._apply_synthetic_noise(ids)
-
-        for i in range(len(y)):
-            if targets[i] != -100:
-                y[i] = targets[i]
-
-        x, y = self._maybe_add_punct(x, y)
-
-        x, y = self._apply_hyphen_artifacts(x, y)
-
-        return (
-            torch.tensor(x, dtype=torch.long),
-            torch.tensor(y, dtype=torch.long),
+        augs.extend(
+            [
+                ("synthetic_noise", self.p_synthetic_noise),
+                ("ending_swap", self.p_ending_swap),
+                ("extra_punct", self.p_extra_punct),
+                ("hyphen_break", self.p_hyphen_break),
+                ("comma_prefix", self.p_comma_prefix),
+                ("repeat_ending", self.p_repeat_ending),
+                ("repeat_beginning", self.p_repeat_beginning),
+            ]
         )
 
-    def force_synthetic_noise(self, ids):
-        """Принудительно применить синтетический шум"""
-        x = ids.copy()
-        y = [-100] * len(ids)
+        total = sum(p for _, p in augs)
+        if total <= 0:
+            return self.make_synthetic_noise()
 
-        candidates = [i for i, tid in enumerate(ids) if tid != self.vocab.eow]
-        if candidates:
-            pos = random.choice(candidates)
-            noise_char = random.choice(list(self.vocab.token_to_id.values()))
-            if noise_char != ids[pos]:
-                x[pos] = noise_char
-                y[pos] = ids[pos]
+        r = random.random() * total
+        s = 0.0
+        choice = augs[-1][0]
+        for name, p in augs:
+            s += p
+            if r <= s:
+                choice = name
+                break
 
-        return x, y
+        if choice == "real_ocr":
+            return self.make_real_ocr()
+        if choice == "ending_swap":
+            return self.make_swap_ending()
+        if choice == "extra_punct":
+            return self.make_extra_punct()
+        if choice == "hyphen_break":
+            return self.make_hyphen_break()
+        if choice == "comma_prefix":
+            return self.make_comma_prefix()
+        if choice == "repeat_ending":
+            return self.make_repeat_ending()
+        if choice == "repeat_beginning":
+            return self.make_repeat_beginning()
+        return self.make_synthetic_noise()
 
-    def force_ending_swap(self, words):
-        """Принудительно применить замену окончания"""
-        if len(words) < 3 or not self.top_endings:
-            return None
+    # ==================================================
+    # REAL OCR WINDOW (inside same image)
+    # ==================================================
 
-        # Выбираем случайное слово (не первое и не последнее)
-        word_idx = random.randint(1, len(words) - 2)
-        word = words[word_idx]
+    def make_real_ocr(self) -> Tuple[torch.Tensor, torch.Tensor]:
+        """
+        Берём одну ошибочную пару (src!=tgt) как anchor,
+        и добираем контекст слева/справа В ТОЙ ЖЕ image-группе.
+        Контекст можно брать любой (и correct, и error),
+        но anchor гарантирует "внутри каждого примера есть ошибка".
+        """
+        img, err_i = random.choice(self.error_refs)
+        pairs = self.pairs_by_image[img]
+        k = self.ocr_window
 
-        if len(word) < 4:
-            return None
+        # ставим ошибку не всегда в центр
+        left = random.randint(0, k - 1)
+        start = max(0, err_i - left)
+        end = min(len(pairs), start + k)
+        start = max(0, end - k)
 
-        # Пробуем заменить окончание
-        for end_len in range(3, 1, -1):
-            if len(word) <= end_len:
+        # гарантируем, что err_i попал
+        if not (start <= err_i < end):
+            start = max(0, min(err_i, len(pairs) - k))
+            end = min(len(pairs), start + k)
+
+        src_ids: List[int] = []
+        tgt_ids: List[int] = []
+        for i in range(start, end):
+            s, t = pairs[i]
+            src_ids.extend(self.vocab.encode(s))
+            src_ids.append(self.vocab.eow)
+            tgt_ids.extend(self.vocab.encode(t))
+            tgt_ids.append(self.vocab.eow)
+
+        return self._finalize(src_ids, tgt_ids)
+
+    # ==================================================
+    # SYNTHETIC BASE
+    # ==================================================
+
+    def _sample_clean_ids(self) -> List[int]:
+        line = random.choice(self.lines)
+        words = line.split()[: self.max_words]
+        ids: List[int] = []
+        for w in words:
+            ids.extend(self.vocab.encode(w))
+            ids.append(self.vocab.eow)
+        return ids[: self.max_len]
+
+    def make_synthetic_noise(self) -> Tuple[torch.Tensor, torch.Tensor]:
+        tgt = self._sample_clean_ids()
+        src = tgt.copy()
+
+        digit_id = self.vocab.digit
+        for i in range(len(src)):
+            if src[i] == self.vocab.eow:
                 continue
-            ending = word[-end_len:]
+            if src[i] == digit_id:
+                continue
+            if random.random() < self.noise_prob:
+                src[i] = random.choice(self.vocab.mlm_replace_ids)
 
-            # Ищем альтернативные окончания той же длины
-            alternatives = [
-                e for e in self.top_endings if len(e) == end_len and e != ending
-            ]
+        return self._finalize(src, tgt)
 
-            if alternatives:
-                new_ending = random.choice(alternatives)
-                noisy_word = word[:-end_len] + new_ending
-                words_copy = words.copy()
-                words_copy[word_idx] = noisy_word
-                return words_copy, word_idx, word, noisy_word
+    # ==================================================
+    # AUGS (you can tune later)
+    # ==================================================
 
-    def force_extra_punct(self, ids):
-        """Принудительно добавить лишнюю пунктуацию"""
-        x = ids.copy()
-        y = [-100] * len(ids)
-
+    def make_extra_punct(self) -> Tuple[torch.Tensor, torch.Tensor]:
+        tgt = self._sample_clean_ids()
+        src = tgt.copy()
         punct_ids = [
             self.vocab.token_to_id.get(p)
-            for p in [",", ".", ";", ":", "!", "?"]
+            for p in [",", ".", ":", ";", "!", "?"]
             if p in self.vocab.token_to_id
         ]
+        if not punct_ids:
+            return self.make_synthetic_noise()
 
-        candidates = [i for i, tid in enumerate(ids) if tid != self.vocab.eow]
-        if candidates and punct_ids:
-            pos = random.choice(candidates)
-            punct_id = random.choice(punct_ids)
-            y[pos] = ids[pos]
-            x[pos] = punct_id
+        # заменяем 1 символ пунктуацией
+        for i in range(len(src)):
+            if src[i] == self.vocab.eow:
+                continue
+            if src[i] == self.vocab.digit:
+                continue
+            src[i] = random.choice(punct_ids)
+            break
 
-        return x, y
+        return self._finalize(src, tgt)
 
-    def force_hyphen_comma(self, ids):
-        """Принудительно добавить дефис-запятую в конце слова"""
-        x = ids.copy()
-        y = [-100] * len(ids)
-
-        hyphen_id = self.vocab.token_to_id.get("-")
+    def make_comma_prefix(self) -> Tuple[torch.Tensor, torch.Tensor]:
+        tgt = self._sample_clean_ids()
+        src = tgt.copy()
         comma_id = self.vocab.token_to_id.get(",")
-        space_id = self.vocab.token_to_id.get(" ")
+        if comma_id is None:
+            return self.make_synthetic_noise()
 
-        if not all([hyphen_id, comma_id, space_id]):
-            return x, y
+        # вставляем запятую после <EOW> (в начало слова)
+        for i in range(len(src) - 1):
+            if src[i] == self.vocab.eow and src[i + 1] != self.vocab.eow:
+                src.insert(i + 1, comma_id)
+                break
 
-        eow_positions = [i for i, tid in enumerate(ids) if tid == self.vocab.eow]
+        return self._finalize(src, tgt)
 
-        valid_positions = [
-            eow_idx
-            for eow_idx in eow_positions
-            if eow_idx >= 3
-            and ids[eow_idx - 1] != self.vocab.eow
-            and ids[eow_idx - 2] != self.vocab.eow
-            and ids[eow_idx - 3] != self.vocab.eow
-        ]
+    def make_hyphen_break(self) -> Tuple[torch.Tensor, torch.Tensor]:
+        tgt = self._sample_clean_ids()
+        src = tgt.copy()
+        hy_id = self.vocab.token_to_id.get("-")
+        if hy_id is None:
+            return self.make_synthetic_noise()
 
-        if valid_positions:
-            eow_idx = random.choice(valid_positions)
-            y[eow_idx - 2] = space_id
-            y[eow_idx - 1] = space_id
-            x[eow_idx - 2] = hyphen_id
-            x[eow_idx - 1] = comma_id
+        # вставляем дефис перед <EOW> в конце слова
+        # word...X <EOW> -> word...X - <EOW>
+        for i in range(1, len(src)):
+            if src[i] == self.vocab.eow and src[i - 1] not in (
+                self.vocab.eow,
+                self.vocab.digit,
+            ):
+                src.insert(i, hy_id)
+                break
 
-        return x, y
+        return self._finalize(src, tgt)
 
-    def force_comma_prefix(self, ids):
-        """Принудительно добавить запятую в начале слова"""
-        x = ids.copy()
-        y = [-100] * len(ids)
+    def _split_words(self, ids: List[int]) -> List[List[int]]:
+        words, cur = [], []
+        for tid in ids:
+            if tid == self.vocab.eow:
+                if cur:
+                    words.append(cur)
+                cur = []
+            else:
+                cur.append(tid)
+        return words
 
-        comma_id = self.vocab.token_to_id.get(",")
-        space_id = self.vocab.token_to_id.get(" ")
+    def make_repeat_ending(self) -> Tuple[torch.Tensor, torch.Tensor]:
+        tgt = self._sample_clean_ids()
+        words = self._split_words(tgt)
+        if not words:
+            return self._finalize(tgt, tgt)
 
-        if not comma_id or not space_id:
-            return x, y
+        w = random.choice(words)
+        if len(w) < 2:
+            return self._finalize(tgt, tgt)
 
-        eow_positions = [i for i, tid in enumerate(ids) if tid == self.vocab.eow]
+        tail = w[-2:]
+        src = tgt.copy()
 
-        valid_positions = [
-            eow_idx
-            for eow_idx in eow_positions
-            if eow_idx + 1 < len(ids) and ids[eow_idx + 1] != self.vocab.eow
-        ]
+        # найдём позицию конца выбранного слова
+        pos = 0
+        for ww in words:
+            pos += len(ww)
+            if ww is w:
+                break
+            pos += 1  # EOW
 
-        if valid_positions:
-            eow_idx = random.choice(valid_positions)
-            y[eow_idx + 1] = space_id
-            x[eow_idx + 1] = comma_id
+        # вставим хвост (иногда с пробелом)
+        if random.random() < 0.5 and " " in self.vocab.token_to_id:
+            src[pos:pos] = [self.vocab.token_to_id[" "]] + tail
+        else:
+            src[pos:pos] = tail
 
-        return x, y
+        return self._finalize(src, tgt)
 
-    def force_repeat_ending(self, ids):
-        """Принудительно добавить повтор окончания"""
-        x = ids.copy()
-        y = [-100] * len(ids)
+    def make_repeat_beginning(self) -> Tuple[torch.Tensor, torch.Tensor]:
+        tgt = self._sample_clean_ids()
+        words = self._split_words(tgt)
+        if not words:
+            return self._finalize(tgt, tgt)
 
-        space_id = self.vocab.token_to_id.get(" ")
-        if not space_id:
-            return x, y
+        w = random.choice(words)
+        if len(w) < 2:
+            return self._finalize(tgt, tgt)
 
-        eow_positions = [i for i, tid in enumerate(ids) if tid == self.vocab.eow]
+        head = w[:2]
+        src = tgt.copy()
 
-        valid_positions = [eow_idx for eow_idx in eow_positions[:-1] if eow_idx >= 4]
+        # найдём начало выбранного слова
+        pos = 0
+        for ww in words:
+            if ww is w:
+                break
+            pos += len(ww) + 1  # +EOW
 
-        if valid_positions:
-            eow_idx = random.choice(valid_positions)
-            dup_len = random.randint(2, 3)
+        if random.random() < 0.5 and " " in self.vocab.token_to_id:
+            src[pos:pos] = head + [self.vocab.token_to_id[" "]]
+        else:
+            src[pos:pos] = head
 
-            if eow_idx >= dup_len + 1:
-                next_word_start = eow_idx + 1
-                if next_word_start + dup_len < len(ids):
-                    for j in range(dup_len):
-                        orig_id = ids[eow_idx - dup_len + j]
-                        if orig_id != self.vocab.eow and next_word_start + j < len(ids):
-                            x[next_word_start + j] = orig_id
-                            y[next_word_start + j] = space_id
+        return self._finalize(src, tgt)
 
-        return x, y
+    def make_swap_ending(self) -> Tuple[torch.Tensor, torch.Tensor]:
+        tgt = self._sample_clean_ids()
+        if not self.top_endings:
+            return self._finalize(tgt, tgt)
 
-    def force_single_hyphen(self, ids):
-        """Принудительно добавить одиночный дефис-разрыв"""
-        x = ids.copy()
-        y = [-100] * len(ids)
+        src = tgt.copy()
+        words = self._split_words(tgt)
+        if len(words) < 3:
+            return self._finalize(tgt, tgt)
 
-        hyphen_id = self.vocab.token_to_id.get("-")
-        space_id = self.vocab.token_to_id.get(" ")
+        # вероятность внутри аугментации (как ты и хотел)
+        p = random.uniform(self.ending_swap_prob_min, self.ending_swap_prob_max)
 
-        if not hyphen_id or not space_id:
-            return x, y
+        for wi, w in enumerate(words):
+            if wi == 0 or wi == len(words) - 1:
+                continue
+            if random.random() > p:
+                continue
 
-        eow_positions = [i for i, tid in enumerate(ids) if tid == self.vocab.eow]
+            word_str = "".join(self.vocab.id_to_token[c] for c in w)
+            for end in self.top_endings:
+                if word_str.endswith(end) and len(word_str) > len(end) + 1:
+                    same_len = [
+                        e for e in self.top_endings if len(e) == len(end) and e != end
+                    ]
+                    if not same_len:
+                        break
+                    new_end = random.choice(same_len)
+                    new_word = word_str[: -len(end)] + new_end
 
-        valid_positions = [
-            eow_idx
-            for eow_idx in eow_positions[:-1]
-            if eow_idx >= 3
-            and ids[eow_idx - 1] != hyphen_id
-            and ids[eow_idx - 1] != self.vocab.eow
-            and ids[eow_idx - 2] != self.vocab.eow
-        ]
+                    # посчитаем позиции в src (по словам)
+                    start_pos = sum(len(words[j]) + 1 for j in range(wi))  # +EOWs
+                    end_pos = start_pos + len(w)
+                    src = (
+                        src[:start_pos]
+                        + self.vocab.encode(new_word)
+                        + [self.vocab.eow]
+                        + src[end_pos + 1 :]
+                    )
+                    return self._finalize(src, tgt)
 
-        if valid_positions:
-            eow_idx = random.choice(valid_positions)
-            y[eow_idx - 1] = space_id
-            x[eow_idx - 1] = hyphen_id
+        return self._finalize(tgt, tgt)
 
-        return x, y
+    # ==================================================
+    # Finalize -> ops
+    # ==================================================
+
+    def _finalize(
+        self, src_ids: List[int], tgt_ids: List[int]
+    ) -> Tuple[torch.Tensor, torch.Tensor]:
+        src_ids = src_ids[: self.max_len]
+        tgt_ids = tgt_ids[: self.max_len * 2]
+
+        ops = levenshtein_ops(src_ids, tgt_ids, self.edit_vocab)
+        ops = ops[: len(src_ids)]
+
+        return (
+            torch.tensor(src_ids, dtype=torch.long),
+            torch.tensor(ops, dtype=torch.long),
+        )

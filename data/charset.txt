@@ -3,6 +3,7 @@
 <EOS>
 <EOW>
 <SEP>
+<DIGIT>
  
 a
 b
