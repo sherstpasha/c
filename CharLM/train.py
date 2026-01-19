@@ -584,7 +584,7 @@ if __name__ == "__main__":
         "text_path": "data/extracted_texts_cleaned.txt",
         "charset_path": "data/charset.txt",
         # exp
-        "exp_dir": "exp_multitask2",
+        "exp_dir": "exp_multitask3",
         "device": "auto",
         "seed": 42,
         # model
@@ -601,7 +601,7 @@ if __name__ == "__main__":
         "lr": 3e-4,
         "weight_decay": 0.01,
         "grad_clip": 1.0,
-        "num_workers": 2,
+        "num_workers": 0,
         # MLM
         "mask_prob": 0.9,
         "min_word_len": 4,
