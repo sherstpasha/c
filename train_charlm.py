@@ -1,5 +1,5 @@
-from CharLM.config import DEFAULT_CONFIG
-from CharLM.train import train
+from charlm.config import DEFAULT_CONFIG
+from charlm.train import train
 
 CONFIG = {**DEFAULT_CONFIG}
 

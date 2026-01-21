@@ -1,50 +1,34 @@
 DEFAULT_CONFIG = {
-    # ======================
-    # Experiment
-    # ======================
-    "exp_dir": "exp_stage_a3",
-    # ======================
-    # Data
-    # ======================
-    "lexicon_path": "data/all_words.txt",
+    "exp_dir": "exp_stage_a10",
+    "checkpoint": None,
+    "words_path": "data/words.txt",
+    "text_path": "data/texts.txt",
+    "pairs_path": "data/pairs.csv",
     "charset_path": "data/charset.txt",
-    "pairs_path": "data/predictionsStackMix-YeniseiGovReports-HW.csv",
-    "max_words_a": 750000,
-    "lexicon_prob": 0.7,
-    "ocr_prob": 0.3,
+    "max_words": 1_500_000,
     "eval_ratio": 0.01,
-    # ======================
-    # Model
-    # ======================
     "max_len": 32,
     "emb_size": 192,
     "n_layers": 6,
     "n_heads": 6,
     "ffn_size": 768,
     "dropout": 0.1,
-    # ======================
-    # Stage A — Lexicon MLM
-    # ======================
-    "batch_a": 256,
-    "epochs_a": 100,
-    "lr_a": 1e-3,
-    # ======================
-    # Masking
-    # ======================
-    "min_word_len": 4,
-    "mask_prob": 0.75,
+    "batch_size": 256,
+    "epochs": 100,
+    "lr": 1e-3,
+    "min_len": 3,
+    "mask_prob": 0.5,
     "span_min": 1,
     "span_max": 3,
-    "num_spans_min": 1,
-    "num_spans_max": 2,
-    # ======================
-    # Optimization
-    # ======================
+    "spans_min": 1, 
+    "spans_max": 2,
     "weight_decay": 0.01,
     "grad_clip": 1.0,
-    # ======================
-    # Runtime
-    # ======================
-    "device": "auto",
+    "ngram_probs": {1: 0.5, 2: 0.3, 3: 0.2},
+    "steps_per_epoch": 1_500_000,
     "seed": 42,
+    "mask_threshold": 0.05,
+    "apply_threshold": 0.95,
+    "max_edits": 1,
+    "sub_threshold": 50,
 }
