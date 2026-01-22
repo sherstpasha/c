@@ -6,6 +6,7 @@ import Levenshtein
 from tqdm import tqdm
 from charlm.model import CharTransformerMLM
 from charlm.utils import CharLMCorrector
+import time
 
 
 def load_model(checkpoint_path, vocab_path, device="cuda"):
@@ -16,8 +17,8 @@ def load_model(checkpoint_path, vocab_path, device="cuda"):
     vocab_size = len(chars)
     
     model = CharTransformerMLM(
-        vocab_size=vocab_size, emb_size=192, max_len=32, n_layers=6,
-        n_heads=6, ffn_size=768, dropout=0.1, pad_idx=c2i["<PAD>"]
+        vocab_size=vocab_size, emb_size=192, max_len=32, n_layers=8,
+        n_heads=6, ffn_size=1024, dropout=0.1, pad_idx=c2i["<PAD>"]
     )
     checkpoint = torch.load(checkpoint_path, map_location=device)
     model.load_state_dict(checkpoint["model"])
@@ -46,6 +47,11 @@ def evaluate_predictions(gt_df, pred_df, corrector=None):
     results = []
     gt_dict = dict(zip(gt_df['filename'], gt_df['text']))
     
+    total_chars_improved = 0
+    total_chars_worsened = 0
+    total_words = 0
+    total_time = 0.0
+    
     for _, row in tqdm(pred_df.iterrows(), total=len(pred_df), desc="Evaluating"):
         filename = row['image']
         pred = normalize_text(str(row['prediction']).lower().strip())
@@ -59,13 +65,29 @@ def evaluate_predictions(gt_df, pred_df, corrector=None):
         acc_before = accuracy(pred, gt)
         
         if corrector:
+            start_time = time.time()
             corrected = corrector.correct_word(pred)
+            end_time = time.time()
+            total_time += (end_time - start_time)
+            total_words += 1
+            
             cer_after = cer(corrected, gt)
             acc_after = accuracy(corrected, gt)
+            
+            # Вычисляем изменение в символах
+            dist_before = Levenshtein.distance(pred, gt)
+            dist_after = Levenshtein.distance(corrected, gt)
+            chars_delta = dist_before - dist_after
+            
+            if chars_delta > 0:
+                total_chars_improved += chars_delta
+            elif chars_delta < 0:
+                total_chars_worsened += abs(chars_delta)
         else:
             corrected = pred
             cer_after = cer_before
             acc_after = acc_before
+            chars_delta = 0
         
         results.append({
             'filename': filename,
@@ -79,115 +101,144 @@ def evaluate_predictions(gt_df, pred_df, corrector=None):
             'improved': cer_after < cer_before,
             'worsened': cer_after > cer_before,
             'unchanged': cer_after == cer_before,
+            'chars_delta': chars_delta,
         })
     
-    return pd.DataFrame(results)
+    words_per_second = total_words / total_time if total_time > 0 else 0
+    
+    return pd.DataFrame(results), total_chars_improved, total_chars_worsened, words_per_second
 
 
-def print_statistics(df, model_name):
+def print_statistics(df, model_name, chars_improved, chars_worsened, words_per_sec):
     print(f"\n{'='*60}")
     print(f"Model: {model_name}")
     print(f"{'='*60}")
     print(f"Total samples: {len(df)}")
     print(f"\nBefore correction:")
     print(f"  CER:      {df['cer_before'].mean():.4f}")
+    print(f"  NED:      {1 - df['cer_before'].mean():.4f}")
     print(f"  Accuracy: {df['acc_before'].mean():.4f}")
     print(f"\nAfter correction:")
     print(f"  CER:      {df['cer_after'].mean():.4f}")
+    print(f"  NED:      {1 - df['cer_after'].mean():.4f}")
     print(f"  Accuracy: {df['acc_after'].mean():.4f}")
     print(f"\nDelta:")
     print(f"  CER:      {df['cer_after'].mean() - df['cer_before'].mean():.4f}")
+    print(f"  NED:      {(1 - df['cer_after'].mean()) - (1 - df['cer_before'].mean()):.4f}")
     print(f"  Accuracy: {df['acc_after'].mean() - df['acc_before'].mean():.4f}")
     print(f"\nChanges:")
-    print(f"  Improved:  {df['improved'].sum()} ({df['improved'].mean()*100:.2f}%)")
-    print(f"  Worsened:  {df['worsened'].sum()} ({df['worsened'].mean()*100:.2f}%)")
+    print(f"  Improved:  {df['improved'].sum()} ({df['improved'].mean()*100:.2f}%) | {chars_improved} chars")
+    print(f"  Worsened:  {df['worsened'].sum()} ({df['worsened'].mean()*100:.2f}%) | {chars_worsened} chars")
     print(f"  Unchanged: {df['unchanged'].sum()} ({df['unchanged'].mean()*100:.2f}%)")
+    print(f"\nPerformance:")
+    print(f"  Speed: {words_per_sec:.2f} words/sec")
 
 
 def main():
-    checkpoint_path = "exp_stage_a3/checkpoints/charlm_epoch_30.pt"
-    vocab_path = "exp_stage_a3/vocab.json"
+    checkpoint_path = "exp_last/checkpoints/charlm_epoch_50.pt"
+    vocab_path = "exp_last/vocab.json"
     words_path = "data/words.txt"
-    device = "cuda" if torch.cuda.is_available() else "cpu"
     
-    print(f"Loading model from {checkpoint_path}")
-    model, c2i, i2c = load_model(checkpoint_path, vocab_path, device)
+    # Тестируем на обоих устройствах
+    devices = []
+    if torch.cuda.is_available():
+        devices.append("cuda")
+    devices.append("cpu")
     
-    print(f"Loading lexicon from {words_path}")
-    with open(words_path, encoding="utf-8") as f:
-        lexicon = set(w.strip().lower() for w in f if w.strip())
-    print(f"Lexicon size: {len(lexicon):,}")
-    
-    substitutions = {}
-    sub_path = os.path.join(os.path.dirname(checkpoint_path), "..", "substitutions.json")
-    sub_path = os.path.normpath(sub_path)
-    if os.path.exists(sub_path):
-        print(f"Loading substitutions from {sub_path}")
-        with open(sub_path, encoding="utf-8") as f:
-            substitutions = json.load(f)
-        print(f"Substitutions loaded: {len(substitutions)}")
-    
-    corrector = CharLMCorrector(
-        model, c2i, i2c, device, max_len=32,
-        mask_threshold=0.01, apply_threshold=0.95, max_edits=1,
-        lexicon=lexicon, min_word_len=3, sub_threshold=100
-    )
-    
-    datasets = [
-        ("YeniseiGovReports-HWR", [
-            "YeniseiGovReports-HWR_dialecticDomino",
-            "YeniseiGovReports-HWR_trba_lite_g1"
-        ]),
-        ("YeniseiGovReports-PRT", [
-            "YeniseiGovReports-PRT_dialecticDomino",
-            "YeniseiGovReports-PRT_trba_lite_g1"
-        ])
-    ]
-    
-    all_results = []
-    
-    for dataset_name, model_names in datasets:
-        gt_path = f"exp/{dataset_name}_gt.csv"
-        gt_df = pd.read_csv(gt_path)
+    for device in devices:
+        print(f"\n{'#'*80}")
+        print(f"# RUNNING ON: {device.upper()}")
+        print(f"{'#'*80}\n")
         
-        print(f"\n\n{'#'*60}")
-        print(f"# Dataset: {dataset_name}")
-        print(f"{'#'*60}")
+        print(f"Loading model from {checkpoint_path}")
+        model, c2i, i2c = load_model(checkpoint_path, vocab_path, device)
         
-        for model_name in model_names:
-            pred_path = f"exp/{model_name}.csv"
-            pred_df = pd.read_csv(pred_path)
+        print(f"Loading lexicon from {words_path}")
+        with open(words_path, encoding="utf-8") as f:
+            lexicon = set(w.strip().lower() for w in f if w.strip())
+        print(f"Lexicon size: {len(lexicon):,}")
+        
+        corrector = CharLMCorrector(
+            model, c2i, i2c, device, max_len=32,
+            mask_threshold=0.01, apply_threshold=0.9, max_edits=1,
+            lexicon=lexicon, min_word_len=4
+        )
+        
+        datasets = [
+            ("YeniseiGovReports-HWR", [
+                "YeniseiGovReports-HWR_dialecticstackmixDomino",
+                "YeniseiGovReports-HWR_trba_lite_g1",
+                "YeniseiGovReports-HWR_trba_base_g1",
+                "YeniseiGovReports-HWR_trocr_ru_1700s"
+            ]),
+            ("YeniseiGovReports-PRT", [
+                "YeniseiGovReports-PRT_dialecticstackmixDomino",
+                "YeniseiGovReports-PRT_trba_lite_g1",
+                "YeniseiGovReports-PRT_trba_base_g1",
+                "YeniseiGovReports-PRT_trocr_ru_1700s"
+            ])
+        ]
+        
+        all_results = []
+        
+        for dataset_name, model_names in datasets:
+            gt_path = f"exp/{dataset_name}_gt.csv"
+            gt_df = pd.read_csv(gt_path)
             
-            results_df = evaluate_predictions(gt_df, pred_df, corrector)
+            print(f"\n\n{'#'*60}")
+            print(f"# Dataset: {dataset_name}")
+            print(f"{'#'*60}")
             
-            print_statistics(results_df, model_name)
-            
-            output_path = f"exp/{model_name}_corrected.csv"
-            results_df.to_csv(output_path, index=False)
-            print(f"\nSaved detailed results to: {output_path}")
-            
-            worsened_df = results_df[results_df['worsened'] == True]
-            if len(worsened_df) > 0:
-                worsened_path = f"exp/{model_name}_worsened.csv"
-                worsened_df.to_csv(worsened_path, index=False)
-                print(f"Saved worsened cases to: {worsened_path}")
-            
-            all_results.append({
-                'dataset': dataset_name,
-                'model': model_name,
-                'cer_before': results_df['cer_before'].mean(),
-                'cer_after': results_df['cer_after'].mean(),
-                'acc_before': results_df['acc_before'].mean(),
-                'acc_after': results_df['acc_after'].mean(),
-                'improved_pct': results_df['improved'].mean() * 100,
-                'worsened_pct': results_df['worsened'].mean() * 100,
-            })
-    
-    summary_df = pd.DataFrame(all_results)
-    summary_df.to_csv("exp/correction_summary.csv", index=False)
-    print(f"\n\nSummary saved to: exp/correction_summary.csv")
-    print("\n" + "="*60)
-    print(summary_df.to_string(index=False))
+            for model_name in model_names:
+                pred_path = f"exp/{model_name}.csv"
+                
+                if not os.path.exists(pred_path):
+                    print(f"\nSkipping {model_name} (file not found)")
+                    continue
+                
+                pred_df = pd.read_csv(pred_path)
+                
+                results_df, chars_improved, chars_worsened, words_per_sec = evaluate_predictions(
+                    gt_df, pred_df, corrector
+                )
+                
+                print_statistics(results_df, model_name, chars_improved, chars_worsened, words_per_sec)
+                
+                output_path = f"exp/{model_name}_corrected_{device}.csv"
+                results_df.to_csv(output_path, index=False)
+                print(f"\nSaved detailed results to: {output_path}")
+                
+                worsened_df = results_df[results_df['worsened'] == True]
+                if len(worsened_df) > 0:
+                    worsened_path = f"exp/{model_name}_worsened_{device}.csv"
+                    worsened_df.to_csv(worsened_path, index=False)
+                    print(f"Saved worsened cases to: {worsened_path}")
+                
+                all_results.append({
+                    'device': device,
+                    'dataset': dataset_name,
+                    'model': model_name,
+                    'cer_before': results_df['cer_before'].mean(),
+                    'cer_after': results_df['cer_after'].mean(),
+                    'ned_before': 1 - results_df['cer_before'].mean(),
+                    'ned_after': 1 - results_df['cer_after'].mean(),
+                    'acc_before': results_df['acc_before'].mean(),
+                    'acc_after': results_df['acc_after'].mean(),
+                    'improved_pct': results_df['improved'].mean() * 100,
+                    'worsened_pct': results_df['worsened'].mean() * 100,
+                    'improved_count': results_df['improved'].sum(),
+                    'worsened_count': results_df['worsened'].sum(),
+                    'chars_improved': chars_improved,
+                    'chars_worsened': chars_worsened,
+                    'words_per_sec': words_per_sec,
+                })
+        
+        summary_df = pd.DataFrame(all_results)
+        summary_path = f"exp/correction_summary_{device}.csv"
+        summary_df.to_csv(summary_path, index=False)
+        print(f"\n\nSummary saved to: {summary_path}")
+        print("\n" + "="*80)
+        print(summary_df.to_string(index=False))
 
 
 if __name__ == "__main__":
